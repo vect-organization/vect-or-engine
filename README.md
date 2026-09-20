@@ -1,10 +1,10 @@
-﻿# VectOrEngine (`vect-or-engine`)
+# VectOrEngine (`vect-or-engine`)
 
 > **High-Performance Rust-Powered Vector Indexing (HNSW) & Semantic Validation Engine**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 [![npm](https://img.shields.io/badge/npm-%401abcdefggs%2Fvect--or--engine-CB3837?style=flat-square&logo=npm)](https://github.com/1abcdefggs/vect-or-engine/packages)
-[![Version: v0.3.0](https://img.shields.io/badge/version-0.3.2-indigo?style=flat-square)](package.json)
+[![Version: v0.3.3](https://img.shields.io/badge/version-0.3.3-indigo?style=flat-square)](package.json)
 [![Rust](https://img.shields.io/badge/Rust-2021_Edition-DEA584?style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![N-API](https://img.shields.io/badge/N--API-Native_Addon-green?style=flat-square&logo=cplusplus&logoColor=white)](https://napi.rs/)

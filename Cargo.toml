@@ -1,6 +1,6 @@
 [package]
 name = "vect_or_engine"
-version = "0.3.2"
+version = "0.3.3"
 edition = "2021"
 authors = ["1abcdefggs"]
 description = "High-performance vector search (HNSW) and semantic validation engine in Rust"
