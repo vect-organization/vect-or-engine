@@ -4,7 +4,7 @@
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
 [![npm](https://img.shields.io/badge/npm-%401abcdefggs%2Fvect--or--engine-CB3837?style=flat-square&logo=npm)](https://github.com/1abcdefggs/vect-or-engine/packages)
-[![Version: v0.3.3](https://img.shields.io/badge/version-0.3.3-indigo?style=flat-square)](package.json)
+[![Version: v0.3.5](https://img.shields.io/badge/version-0.3.5-indigo?style=flat-square)](package.json)
 [![Rust](https://img.shields.io/badge/Rust-2021_Edition-DEA584?style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/)
 [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
 [![N-API](https://img.shields.io/badge/N--API-Native_Addon-green?style=flat-square&logo=cplusplus&logoColor=white)](https://napi.rs/)
@@ -63,7 +63,6 @@ vect-or-engine/
 │   ├── test-napi.js    # Node.js N-API integration tests
 │   └── test-kb.json    # Minimal test dataset
 └── src/
-    ├── lib.rs          # Core Rust library crate root
     ├── main.rs         # Headless CLI binary (vect_or_engine_cli)
     ├── hnsw_index.rs   # HNSW graph indexing & search implementation
     ├── knowledge_store.rs # Vector quantization (f16), mmap, and SQLite store

@@ -105,11 +105,17 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
 
             match std::fs::read_to_string(&path) {
                 Err(e) => RpcResponse::err(format!("Cannot read '{path}': {e}"), req.id),
-                Ok(content) => match Profile::load_from_json_str(&content) {
+                Ok(content) => match Profile::load_any_json_str(&content) {
                     Err(e) => RpcResponse::err(format!("Invalid profile JSON: {e}"), req.id),
+                    Ok(profile) if profile.is_empty() => {
+                        RpcResponse::err(Profile::EMPTY_MESSAGE.to_string(), req.id)
+                    }
                     Ok(profile) => {
+                        // Swap rules only; keep the loaded KB / index (was reset by EngineState::new).
                         let mut s = state.write().await;
-                        *s = EngineState::new(profile);
+                        s.validator = Validator::new(&profile);
+                        s.translator = Translator::new(&profile);
+                        s.profile = profile;
                         RpcResponse::ok(serde_json::json!({"loaded":true,"path":path}), req.id)
                     }
                 },

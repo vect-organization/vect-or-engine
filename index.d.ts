@@ -28,7 +28,11 @@ export interface JsKbInfo {
 /** Validates a document using the currently loaded profile. */
 export declare function validateSync(text: string): JsValidationResult
 export declare function validate(text: string): Promise<JsValidationResult>
-export declare function loadProfile(path: string): Promise<void>
+/**
+ * `match_mode` is `"literal"` (default), `"regex"` or `"both"` (ADR-0006). To change the mode,
+ * call this again with the same profile; the rules are rebuilt and the KB is kept.
+ */
+export declare function loadProfile(path: string, matchMode?: string | undefined | null): Promise<void>
 export declare function loadKnowledgeBase(path: string): Promise<number>
 export declare function loadKbCache(path: string): Promise<number>
 export declare function saveKbCache(path: string): Promise<void>

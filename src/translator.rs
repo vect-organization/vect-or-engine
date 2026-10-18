@@ -69,3 +69,75 @@ impl Translator {
         results
     }
 }
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+
+    fn profile_from(json: &str) -> Profile {
+        Profile::load_from_json_str(json).expect("test profile JSON must parse")
+    }
+
+    const TWO_RULES: &str = r#"{
+        "conversational_translation_rules": {
+            "rules": [
+                {"item_id": "A1", "item_name": "greeting",
+                 "colloquial_patterns": ["ちょっと"], "templates": {"A": "a1"}},
+                {"item_id": "B2", "item_name": "agreement",
+                 "colloquial_patterns": ["やばい", "まじ"], "templates": {"A": "b2"}}
+            ]
+        }
+    }"#;
+
+    #[test]
+    fn matches_colloquial_phrase_with_its_item() {
+        let t = Translator::new(&profile_from(TWO_RULES));
+        let hits = t.match_colloquial("今日はちょっと疲れた");
+        assert_eq!(hits.len(), 1);
+        assert_eq!(hits[0].item_id, "A1");
+        assert_eq!(hits[0].item_name, "greeting");
+        assert_eq!(hits[0].detected_colloquial, "ちょっと");
+        assert_eq!(hits[0].templates.get("A").map(String::as_str), Some("a1"));
+    }
+
+    #[test]
+    fn no_phrase_means_no_match() {
+        let t = Translator::new(&profile_from(TWO_RULES));
+        assert!(t.match_colloquial("丁寧な表現だけの文").is_empty());
+    }
+
+    #[test]
+    fn each_pattern_maps_to_its_own_rule_across_rules() {
+        // Index mapping regression: patterns from the second rule must not
+        // resolve to the first rule's item_id.
+        let t = Translator::new(&profile_from(TWO_RULES));
+        let hits = t.match_colloquial("まじやばい");
+        assert_eq!(hits.len(), 2);
+        assert!(hits.iter().all(|h| h.item_id == "B2"));
+        let phrases: Vec<&str> = hits.iter().map(|h| h.detected_colloquial.as_str()).collect();
+        assert!(phrases.contains(&"まじ"));
+        assert!(phrases.contains(&"やばい"));
+    }
+
+    #[test]
+    fn same_phrase_found_multiple_times_is_reported_each_time() {
+        let t = Translator::new(&profile_from(TWO_RULES));
+        let hits = t.match_colloquial("ちょっと、ちょっと");
+        assert_eq!(hits.len(), 2);
+    }
+
+    #[test]
+    fn profile_without_translation_rules_matches_nothing() {
+        let t = Translator::new(&profile_from("{}"));
+        assert!(t.match_colloquial("ちょっと").is_empty());
+    }
+
+    #[test]
+    fn empty_rule_list_builds_no_automaton() {
+        let t = Translator::new(&profile_from(
+            r#"{"conversational_translation_rules": {"rules": []}}"#,
+        ));
+        assert!(t.ac.is_none());
+        assert!(t.match_colloquial("ちょっと").is_empty());
+    }
+}

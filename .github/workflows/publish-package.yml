@@ -6,7 +6,7 @@ on:
   workflow_dispatch:
 
 permissions:
-  contents: read
+  contents: write
   packages: write
 
 jobs:
@@ -36,6 +36,13 @@ jobs:
         run: |
           cargo test --quiet
           npm test
+
+      - name: Upload Binary to GitHub Release
+        if: github.event_name == 'release'
+        env:
+          GITHUB_TOKEN: ${{ secrets.GITHUB_TOKEN }}
+        run: |
+          gh release upload ${{ github.event.release.tag_name }} *.node --clobber
 
       - name: Publish to GitHub Packages
         run: npm publish

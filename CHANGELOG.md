@@ -7,6 +7,32 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.5] - 2026-10-01
+
+### Fixed
+- `load_profile` replaced the whole `Engine`, silently discarding the loaded KB and HNSW index; now swaps profile / validator / translator only (lib.rs, main.rs CLI)
+- `search` accepted queries of a different dimension and `dot_product_simd` truncated to `min(len)` (meaningless scores); now returns `DimensionMismatch`
+
+### Added
+- `Profile::load_any_json_str` + `from_guideline_json_str`: vect-or-generate `guideline_*.json` adapted into Profile (previously deserialized to an all-`None` Profile without error); `Profile::is_empty`; unit tests
+- `load_profile(path, match_mode?)`: keyword-rule matching mode `literal` (default, unchanged behaviour), `regex`, or `both` (literal OR regex; a trigger word that is not a valid regex matches as literal text under `both`). Invalid regexes are rejected at load time and keep the previously loaded rules (ADR-0006)
+- Unit tests for the translator (colloquial matching and per-rule item mapping), the match modes, and the 0.3.5 regressions (KB kept on `load_profile`, dimension check)
+
+### Changed
+- `Profile::is_empty` destructures `DocumentTemplate`, so a new field there fails to compile until the check is updated
+
+---
+
+## [0.3.4] - 2026-09-20
+
+### Added
+- **Automated GitHub Release Binary Upload**: Updated `.github/workflows/publish-package.yml` with `contents: write` permissions and `gh release upload` step to automatically attach compiled native binary addons (`*.node`) to GitHub Releases upon publication.
+
+### Changed
+- **Node.js 24 Environment Maintenance**: Explicitly set and maintained `node-version: 24` in release workflows for modern runner compatibility.
+
+---
+
 ## [0.3.3] - 2026-09-20
 
 ### Changed

@@ -25,17 +25,95 @@ pub struct ValidationResult {
     pub markers: Vec<ValidationMarker>,
 }
 
+/// How keyword-rule `trigger_words` are matched against the document (ADR-0006).
+#[derive(Debug, Clone, Copy, PartialEq, Eq, Default)]
+pub enum MatchMode {
+    /// Plain substring match (the behaviour before ADR-0006).
+    #[default]
+    Literal,
+    /// The trigger word is a regular expression.
+    Regex,
+    /// A trigger word matches if either the literal or the regex form matches (OR).
+    Both,
+}
+
+impl MatchMode {
+    /// Parses the mode name used across the N-API boundary. Unknown names return `None`.
+    pub fn parse(name: &str) -> Option<Self> {
+        match name {
+            "literal" => Some(Self::Literal),
+            "regex" => Some(Self::Regex),
+            "both" => Some(Self::Both),
+            _ => None,
+        }
+    }
+}
+
+/// One compiled trigger word. Regexes are compiled once at load time.
+enum Matcher {
+    Literal(String),
+    Regex(Regex),
+    Both(String, Regex),
+}
+
+impl Matcher {
+    fn compile(word: &str, mode: MatchMode) -> Result<Self, String> {
+        let regex = || {
+            Regex::new(word).map_err(|e| format!("invalid regex '{word}' in keyword rule: {e}"))
+        };
+        Ok(match mode {
+            MatchMode::Literal => Matcher::Literal(word.to_string()),
+            MatchMode::Regex => Matcher::Regex(regex()?),
+            // `both` must not reject a word that is only a valid literal (e.g. "C++", "("):
+            // if it is not a valid regex, it simply matches as literal text.
+            MatchMode::Both => match regex() {
+                Ok(re) => Matcher::Both(word.to_string(), re),
+                Err(_) => Matcher::Literal(word.to_string()),
+            },
+        })
+    }
+
+    /// Byte offset of the first match, if any. Used for the marker's line number.
+    fn find(&self, text: &str) -> Option<usize> {
+        match self {
+            Matcher::Literal(s) => text.find(s.as_str()),
+            Matcher::Regex(re) => re.find(text).map(|m| m.start()),
+            Matcher::Both(s, re) => {
+                let lit = text.find(s.as_str());
+                let rx = re.find(text).map(|m| m.start());
+                match (lit, rx) {
+                    (Some(a), Some(b)) => Some(a.min(b)),
+                    (a, b) => a.or(b),
+                }
+            }
+        }
+    }
+}
+
+struct CompiledKeywordRule {
+    warning_message: String,
+    matchers: Vec<Matcher>,
+}
+
 pub struct Validator {
     value_regex: Option<Regex>,
     value_warning_template: Option<String>,
     conflict_items_ac: Option<AhoCorasick>,
     conflict_item_reasons: Vec<String>,
     min_value: u32,
-    keyword_rules: Vec<crate::profile::KeywordRule>,
+    keyword_rules: Vec<CompiledKeywordRule>,
 }
 
 impl Validator {
+    /// Literal matching. Cannot fail: literal trigger words are never compiled.
     pub fn new(profile: &Profile) -> Self {
+        Self::with_mode(profile, MatchMode::Literal)
+            .expect("literal keyword matching never fails to compile")
+    }
+
+    /// Builds the validator with the given keyword matching mode. Fails on an invalid regex,
+    /// so the caller can keep the previously loaded rules.
+    pub fn with_mode(profile: &Profile, mode: MatchMode) -> Result<Self, String> {
         let mut patterns = Vec::new();
         let mut reasons = Vec::new();
         let mut min_value = 0;
@@ -68,7 +146,17 @@ impl Validator {
                 }
             }
             if let Some(keywords) = &rules.keyword_rules {
-                keyword_rules = keywords.clone();
+                for rule in keywords {
+                    let matchers = rule
+                        .trigger_words
+                        .iter()
+                        .map(|w| Matcher::compile(w, mode))
+                        .collect::<Result<Vec<_>, _>>()?;
+                    keyword_rules.push(CompiledKeywordRule {
+                        warning_message: rule.warning_message.clone(),
+                        matchers,
+                    });
+                }
             }
         }
 
@@ -78,14 +166,14 @@ impl Validator {
             None
         };
 
-        Validator {
+        Ok(Validator {
             value_regex,
             value_warning_template,
             conflict_items_ac,
             conflict_item_reasons: reasons,
             min_value,
             keyword_rules,
-        }
+        })
     }
 
     pub fn validate(&self, text: &str) -> ValidationResult {
@@ -150,13 +238,13 @@ impl Validator {
 
         // 3. Keyword Rule Check (Dynamic)
         for rule in &self.keyword_rules {
-            if !rule.trigger_words.is_empty() && rule.trigger_words.iter().all(|word| text.contains(word.as_str())) {
+            if !rule.matchers.is_empty() && rule.matchers.iter().all(|m| m.find(text).is_some()) {
                 has_keyword_conflict = true;
                 let msg = rule.warning_message.clone();
                 keyword_message = Some(msg.clone());
                 // Find the line of the first trigger word.
-                let line = rule.trigger_words.first()
-                    .and_then(|w| text.find(w.as_str()))
+                let line = rule.matchers.first()
+                    .and_then(|m| m.find(text))
                     .map(|o| offset_to_line(o))
                     .unwrap_or(1);
                 markers.push(ValidationMarker {
@@ -230,5 +318,80 @@ mod tests {
         assert!(!res3.is_valid);
         assert!(res3.has_keyword_conflict);
         assert!(res3.keyword_message.as_deref().unwrap().contains("breach"));
+    }
+
+    /// One keyword rule whose single trigger word is `word` (given as raw JSON-escaped text).
+    fn keyword_profile(json_word: &str) -> Profile {
+        Profile::load_from_json_str(&format!(
+            r#"{{"assessment_rules":{{"keyword_rules":[{{"trigger_words":["{json_word}"],"warning_message":"hit"}}]}}}}"#
+        ))
+        .expect("test profile JSON must parse")
+    }
+
+    #[test]
+    fn match_mode_parse_accepts_only_known_names() {
+        assert_eq!(MatchMode::parse("literal"), Some(MatchMode::Literal));
+        assert_eq!(MatchMode::parse("regex"), Some(MatchMode::Regex));
+        assert_eq!(MatchMode::parse("both"), Some(MatchMode::Both));
+        assert_eq!(MatchMode::parse("Regex"), None);
+        assert_eq!(MatchMode::parse(""), None);
+        assert_eq!(MatchMode::default(), MatchMode::Literal);
+    }
+
+    #[test]
+    fn literal_mode_treats_metacharacters_as_plain_text() {
+        // "." is an ordinary character here, so "G91" must not hit "G.1".
+        let v = Validator::with_mode(&keyword_profile("G.1"), MatchMode::Literal).unwrap();
+        assert!(v.validate("code G.1 here").has_keyword_conflict);
+        assert!(!v.validate("code G91 here").has_keyword_conflict);
+    }
+
+    #[test]
+    fn regex_mode_matches_pattern_and_reports_its_line() {
+        // \d+ does not occur literally in the text, so only the regex form can hit.
+        let v = Validator::with_mode(&keyword_profile(r"G\\d+"), MatchMode::Regex).unwrap();
+        let res = v.validate("intro line\nsee G42 for details");
+        assert!(res.has_keyword_conflict);
+        assert_eq!(res.markers[0].line, 2);
+        assert!(!v.validate("no code here").has_keyword_conflict);
+    }
+
+    #[test]
+    fn regex_mode_dot_matches_any_character() {
+        // In regex mode "." is a wildcard, so "abc" hits. Literal mode would miss it.
+        let v = Validator::with_mode(&keyword_profile("a.c"), MatchMode::Regex).unwrap();
+        assert!(v.validate("abc").has_keyword_conflict);
+        let lit = Validator::with_mode(&keyword_profile("a.c"), MatchMode::Literal).unwrap();
+        assert!(!lit.validate("abc").has_keyword_conflict);
+    }
+
+    #[test]
+    fn both_mode_matches_when_either_form_matches() {
+        let v = Validator::with_mode(&keyword_profile("a.c"), MatchMode::Both).unwrap();
+        assert!(v.validate("abc").has_keyword_conflict, "regex side should hit");
+        assert!(v.validate("a.c").has_keyword_conflict, "literal side should hit");
+        assert!(!v.validate("ac").has_keyword_conflict, "neither side matches");
+    }
+
+    #[test]
+    fn both_mode_accepts_words_that_are_only_valid_literals() {
+        // "C++" and "(" are not valid regexes, but they must still match as literal text.
+        let cpp = Validator::with_mode(&keyword_profile("C++"), MatchMode::Both)
+            .expect("both mode must accept a non-regex literal");
+        assert!(cpp.validate("we use C++ here").has_keyword_conflict);
+
+        let paren = Validator::with_mode(&keyword_profile("("), MatchMode::Both)
+            .expect("both mode must accept a lone parenthesis");
+        assert!(paren.validate("see (note)").has_keyword_conflict);
+    }
+
+    #[test]
+    fn invalid_regex_is_rejected_at_build_time() {
+        let err = Validator::with_mode(&keyword_profile("("), MatchMode::Regex)
+            .err()
+            .expect("unbalanced parenthesis must fail to compile");
+        assert!(err.contains("invalid regex"), "message: {err}");
+        // Literal mode never compiles trigger words, so the same text is accepted there.
+        assert!(Validator::with_mode(&keyword_profile("("), MatchMode::Literal).is_ok());
     }
 }

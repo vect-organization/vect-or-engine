@@ -33,7 +33,7 @@ pub use hnsw_index::HnswIndex;
 pub use knowledge_store::{KnowledgeItem, KnowledgeStore, SearchQuery, SearchResult};
 pub use profile::Profile;
 pub use translator::{TranslationMatch, Translator};
-pub use validator::{ValidationMarker, ValidationResult, Validator};
+pub use validator::{MatchMode, ValidationMarker, ValidationResult, Validator};
 
 // --- Global Engine State ---
 
@@ -149,16 +149,38 @@ pub async fn validate(text: String) -> Result<JsValidationResult> {
     Ok(result.into())
 }
 
+/// `match_mode` is `"literal"` (default), `"regex"` or `"both"` (ADR-0006). To change the mode,
+/// call this again with the same profile; the rules are rebuilt and the KB is kept.
 #[napi]
-pub async fn load_profile(path: String) -> Result<()> {
+pub async fn load_profile(path: String, match_mode: Option<String>) -> Result<()> {
     verify_safe_path(&path)?;
+    let mode = match match_mode.as_deref() {
+        None => MatchMode::default(),
+        Some(name) => MatchMode::parse(name).ok_or_else(|| {
+            Error::new(
+                Status::InvalidArg,
+                format!("Unknown match_mode '{name}' (expected literal, regex or both)"),
+            )
+        })?,
+    };
     let content = std::fs::read_to_string(&path)
         .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to read profile: {e}")))?;
-    let profile = Profile::load_from_json_str(&content)
+    let profile = Profile::load_any_json_str(&content)
         .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to parse profile: {e}")))?;
+    if profile.is_empty() {
+        return Err(Error::new(Status::InvalidArg, Profile::EMPTY_MESSAGE.to_string()));
+    }
+    // Build everything that can fail (e.g. an invalid regex) before touching the engine,
+    // so a bad profile leaves the previously loaded rules in place.
+    let validator = Validator::with_mode(&profile, mode)
+        .map_err(|e| Error::new(Status::InvalidArg, e))?;
 
+    // Swap rules only. Replacing the whole Engine (previous behaviour) also reset
+    // knowledge_store, silently discarding a loaded KB and its HNSW index.
     let mut engine = ENGINE.write().await;
-    *engine = Engine::new(profile);
+    engine.validator = validator;
+    engine.translator = Translator::new(&profile);
+    engine.profile = profile;
     Ok(())
 }
 
@@ -212,9 +234,24 @@ pub async fn build_index() -> Result<u32> {
     .map_err(|e| Error::new(Status::GenericFailure, e)) // Handle our custom error
 }
 
+/// ADR-0005 Phase4.3: reject a query from a different vector space instead of letting
+/// dot_product_simd truncate to min(len) and return meaningless scores. `expected == 0`
+/// means no KB is loaded yet, so there is nothing to compare against.
+fn ensure_query_dim(expected: usize, got: usize) -> Result<()> {
+    if expected != 0 && got != expected {
+        return Err(Error::new(
+            Status::InvalidArg,
+            EngineError::DimensionMismatch { expected, got }.to_string(),
+        ));
+    }
+    Ok(())
+}
+
 #[napi]
 pub async fn search(query: Float32Array, top_k: u32) -> Result<Vec<JsSearchResult>> {
     let engine = ENGINE.read().await;
+    // The caller (vect-or-edit) falls back to Module 0 (P.scan dictionary matching) on this error.
+    ensure_query_dim(engine.knowledge_store.dim, query.len())?;
     // Pass query by reference to avoid allocation.
     let results = engine.knowledge_store.search(&query, top_k as usize);
     Ok(results.iter().map(Into::into).collect())
@@ -246,4 +283,71 @@ fn verify_safe_path(path_str: &str) -> Result<()> {
         ));
     }
     Ok(())
+}
+
+#[cfg(test)]
+mod tests {
+    use super::*;
+    use crate::knowledge_store::SlimItem;
+
+    #[test]
+    fn query_dim_check_skips_when_no_kb_is_loaded() {
+        assert!(ensure_query_dim(0, 3).is_ok());
+    }
+
+    #[test]
+    fn query_dim_check_accepts_matching_dim() {
+        assert!(ensure_query_dim(384, 384).is_ok());
+    }
+
+    #[test]
+    fn query_dim_check_rejects_mismatch() {
+        let err = ensure_query_dim(384, 768).unwrap_err();
+        assert!(err.reason.contains("expected 384"), "reason: {}", err.reason);
+        assert!(err.reason.contains("got 768"), "reason: {}", err.reason);
+    }
+
+    fn write_temp_profile(name: &str, body: &str) -> String {
+        let path = std::env::temp_dir()
+            .join(format!("vect_engine_{name}_{}.json", std::process::id()));
+        std::fs::write(&path, body).expect("temp profile must be writable");
+        path.to_string_lossy().into_owned()
+    }
+
+    // Single test on purpose: it mutates the global ENGINE, and parallel tests would race on it.
+    #[test]
+    fn load_profile_keeps_kb_and_rejects_empty_profile() {
+        let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
+        rt.block_on(async {
+            {
+                let mut e = ENGINE.write().await;
+                e.knowledge_store.dim = 3;
+                e.knowledge_store.items.push(SlimItem {
+                    id: Some("kb-1".to_string()),
+                    metadata: serde_json::Map::new(),
+                });
+            }
+
+            // 0.3.5 regression: swapping rules must keep the loaded KB and its dimension.
+            let valid = write_temp_profile(
+                "valid",
+                r#"{"conversational_translation_rules":{"rules":[{"item_id":"X","item_name":"n","colloquial_patterns":["foo"],"templates":{"A":"t"}}]}}"#,
+            );
+            load_profile(valid, None).await.expect("valid profile must load");
+            {
+                let e = ENGINE.read().await;
+                assert_eq!(e.knowledge_store.dim, 3, "dim was reset by load_profile");
+                assert_eq!(e.knowledge_store.items.len(), 1, "KB items were dropped");
+                assert!(!e.translator.match_colloquial("foo").is_empty());
+            }
+
+            // An empty profile must be refused and must not touch the loaded state.
+            let empty = write_temp_profile("empty", "{}");
+            let err = load_profile(empty, None).await.expect_err("empty profile must be rejected");
+            assert_eq!(err.reason, Profile::EMPTY_MESSAGE);
+            let e = ENGINE.read().await;
+            assert_eq!(e.knowledge_store.dim, 3);
+            assert_eq!(e.knowledge_store.items.len(), 1);
+        });
+    }
 }
