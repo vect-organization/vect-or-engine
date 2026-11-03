@@ -142,6 +142,12 @@ npm test
 npm run start-mcp
 ```
 
+> 🔒 **No request gate yet**: The server listens on `127.0.0.1` only, but it has no authentication and does not limit which files `load` may read. Any local process, or a browser page using DNS rebinding, can call it while it runs. Start it only when you need it and stop it afterwards.
+>
+> A request gate (`Host` / `Origin` check, bearer token, allowed folder for `load`) is in development on the [`feat/mcp-request-gate`](https://github.com/1abcdefggs/vect-or-engine/tree/feat/mcp-request-gate) branch and is not part of this release.
+
+Errors follow JSON-RPC 2.0: -32700 parse error, -32600 invalid request, -32601 unknown method, -32602 invalid params (with the reason), -32603 internal error (details only in the server log).
+
 ---
 
 ## Installation in Electron / Node.js Apps
@@ -221,7 +227,8 @@ A static and dynamic security audit on 2026-09-14 rated VectOrEngine **A+**. Its
 
 Later review found points the audit did not cover; the audit report is to be amended:
 - The source has 5 `unsafe` blocks: 2 in `hnsw_index.rs` (`get_unchecked` in the 4-way unrolled dot product and its tail) and 3 in `knowledge_store.rs` (one mmap, two `get_unchecked` loops). Memory safety outside these blocks is checked at compile time
-- The MCP server has no authentication; CSRF and DNS rebinding have not been assessed. It is experimental and runs only when started with `npm run start-mcp`
+- The MCP server has no authentication and no limit on the files `load` may read; CSRF and DNS rebinding are not blocked. It is experimental and runs only when started with `npm run start-mcp`. A request gate is in development on the `feat/mcp-request-gate` branch (see [Start MCP Server](#start-mcp-server-port-4000-experimental--unverified))
+- Since 0.3.6 the MCP server no longer returns raw error details to the client (CodeQL alert #1); internal errors answer `Internal error` and are logged on the server
 
 📄 *The audit report (`SECURITY_AUDIT_REPORT_20260914.md`) is kept in the internal workspace and is not published in this repository.*
 
