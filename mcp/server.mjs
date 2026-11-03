@@ -15,8 +15,14 @@
  *
  * All requests: POST /mcp  body: { id, method, params }
  * All responses: { jsonrpc:"2.0", id, result } | { jsonrpc:"2.0", id, error }
+ *
+ * Request gate:
+ *   Host / Origin     only 127.0.0.1 and localhost (HTTP 403 otherwise)
+ *   MCP_AUTH_TOKEN    when set, requires "Authorization: Bearer <token>" (HTTP 401 otherwise)
+ *   KB_ALLOWED_ROOT   `load` paths must resolve under this folder (default: this repository)
  */
 
+import fs from 'node:fs';
 import http from 'node:http';
 import path from 'node:path';
 import { createRequire } from 'node:module';
@@ -45,6 +51,64 @@ if (!engine) {
   process.exit(1);
 }
 
+// ─── Request gate ─────────────────────────────────────────────────────────────
+
+const MCP_AUTH_TOKEN = process.env['MCP_AUTH_TOKEN'] ?? '';
+const KB_ALLOWED_ROOT = path.resolve(process.env['KB_ALLOWED_ROOT'] ?? path.join(__dirname, '..'));
+
+let kbAllowedRootReal;
+try {
+  kbAllowedRootReal = fs.realpathSync(KB_ALLOWED_ROOT);
+} catch {
+  console.error(`[MCP] FATAL: KB_ALLOWED_ROOT does not exist: ${KB_ALLOWED_ROOT}`);
+  process.exit(1);
+}
+
+const LOOPBACK_HOSTS = new Set(['127.0.0.1', 'localhost']);
+
+// The server listens on 127.0.0.1 only; a foreign Host header means DNS rebinding
+function isLocalHostHeader(hostHeader) {
+  if (typeof hostHeader !== 'string') return false;
+  return LOOPBACK_HOSTS.has(hostHeader.replace(/:\d+$/, '').trim().toLowerCase());
+}
+
+// Non-browser clients send no Origin; browsers must come from a loopback page
+function isAllowedOrigin(originHeader) {
+  if (originHeader === undefined) return true;
+  try {
+    return LOOPBACK_HOSTS.has(new URL(originHeader).hostname.toLowerCase());
+  } catch {
+    return false;
+  }
+}
+
+function isAuthorized(req) {
+  if (!MCP_AUTH_TOKEN) return true; // token check is opt-in
+  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
+  return !!m && m[1] === MCP_AUTH_TOKEN;
+}
+
+function isSubPath(child, parent) {
+  const rel = path.relative(parent, child);
+  return rel === '' || (!rel.startsWith('..') && !path.isAbsolute(rel));
+}
+
+// Checks the path as written before touching the file system, then again after
+// resolving links, and returns the resolved path that was checked
+function resolveKbPath(kbPath) {
+  const outside = 'Invalid params: path is outside KB_ALLOWED_ROOT';
+  const resolved = path.resolve(kbPath);
+  if (!isSubPath(resolved, KB_ALLOWED_ROOT)) throw new RpcError(-32602, outside);
+  let real;
+  try {
+    real = fs.realpathSync(resolved);
+  } catch {
+    throw new RpcError(-32602, 'Invalid params: path not found');
+  }
+  if (!isSubPath(real, kbAllowedRootReal)) throw new RpcError(-32602, outside);
+  return real;
+}
+
 // ─── JSON-RPC errors ──────────────────────────────────────────────────────────
 
 // Errors caused by the request; their message is safe to return to the client
@@ -64,8 +128,8 @@ function toRpcError(err) {
   return { code: -32603, message: 'Internal error' };
 }
 
-function sendRpc(res, payload) {
-  res.writeHead(200); // JSON-RPC always 200
+function sendRpc(res, payload, status = 200) {
+  res.writeHead(status); // JSON-RPC answers use 200; the request gate uses 401 / 403
   res.end(JSON.stringify(payload));
 }
 
@@ -79,10 +143,11 @@ async function dispatch(method, params) {
 
     case 'load': {
       const kbPath = params?.path;
-      if (!kbPath) throw new RpcError(-32602, 'Missing param: path');
+      if (typeof kbPath !== 'string' || !kbPath) throw new RpcError(-32602, 'Missing param: path');
+      const checkedPath = resolveKbPath(kbPath);
       const fn = engine.loadKnowledgeBase ?? engine.load_knowledge_base;
       if (!fn) throw new Error('Engine method loadKnowledgeBase not found');
-      const count = await fn.call(engine, kbPath);
+      const count = await fn.call(engine, checkedPath);
       return { loaded: true, count };
     }
 
@@ -142,6 +207,15 @@ const server = http.createServer(async (req, res) => {
   if (req.method !== 'POST' || req.url !== '/mcp') {
     res.writeHead(404);
     res.end(JSON.stringify({ error: 'Not found. POST /mcp' }));
+    return;
+  }
+
+  if (!isLocalHostHeader(req.headers.host) || !isAllowedOrigin(req.headers.origin)) {
+    sendRpc(res, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Forbidden host or origin' } }, 403);
+    return;
+  }
+  if (!isAuthorized(req)) {
+    sendRpc(res, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Unauthorized' } }, 401);
     return;
   }
 

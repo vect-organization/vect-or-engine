@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+Planned as 0.4.0: the MCP request gate changes how the server is used.
+
+### Security
+- MCP server ran any request without a gate (Copilot code-scanning AI finding on PR #17, "Excessive agency risk"). Added before dispatch: `Host` / `Origin` must be `127.0.0.1` or `localhost` (HTTP 403), an opt-in bearer token via `MCP_AUTH_TOKEN` (HTTP 401), and `load` paths must resolve, links included, under `KB_ALLOWED_ROOT` (default: the repository; checked as written before any file access, then after resolving links). **Behaviour change**: `load` outside the repository now needs `KB_ALLOWED_ROOT`
+
 ## [0.3.6] - 2026-11-03
 
 ### Fixed
