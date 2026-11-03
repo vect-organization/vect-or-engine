@@ -84,8 +84,10 @@ function isAllowedOrigin(originHeader) {
 
 function isAuthorized(req) {
   if (!MCP_AUTH_TOKEN) return true; // token check is opt-in
-  const m = /^Bearer\s+(.+)$/i.exec(req.headers.authorization ?? '');
-  return !!m && m[1] === MCP_AUTH_TOKEN;
+  // Plain string checks: a regex on this header was flagged as polynomial (ReDoS)
+  const auth = String(req.headers.authorization ?? '');
+  if (auth.slice(0, 7).toLowerCase() !== 'bearer ') return false;
+  return auth.slice(7).trim() === MCP_AUTH_TOKEN;
 }
 
 function isSubPath(child, parent) {
