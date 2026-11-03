@@ -51,7 +51,7 @@
 vect-or-engine/
 ├── Cargo.toml          # Rust crate configuration (v0.3.0) & optimization profiles
 ├── Cargo.lock          # Deterministic Rust dependency lockfile
-├── lib.rs              # N-API bindings & Node.js native interface (bridge layer)
+├── lib.rs              # Crate root: core engine modules & public re-exports (no N-API)
 ├── index.js            # Cross-platform native addon loader
 ├── index.d.ts          # TypeScript type declarations
 ├── package.json        # npm package configuration & NAPI metadata (@1abcdefggs/vect-or-engine)
@@ -63,7 +63,8 @@ vect-or-engine/
 │   ├── test-napi.js    # Node.js N-API integration tests
 │   └── test-kb.json    # Minimal test dataset
 └── src/
-    ├── main.rs         # Headless CLI binary (vect_or_engine_cli)
+    ├── napi_bindings.rs # N-API bindings & Node.js native interface (only with --features napi)
+    ├── main.rs         # Headless CLI binary (vect_or_engine_cli), core engine only
     ├── hnsw_index.rs   # HNSW graph indexing & search implementation
     ├── knowledge_store.rs # Vector quantization (f16), mmap, and SQLite store
     ├── validator.rs    # Real-time static linter & rule evaluator
@@ -71,6 +72,15 @@ vect-or-engine/
     ├── profile.rs      # Schema-driven profile deserializer
     └── engine_error.rs # Typed engine error definitions
 ```
+
+The core engine (`src/*.rs` except `napi_bindings.rs`) has no N-API dependency. The `.node` addon and the CLI both build on it:
+
+| Target | Command | Includes N-API |
+| :--- | :--- | :--- |
+| Node.js addon (`.node`) | `npm run build` (passes `--features napi`) | Yes |
+| CLI (`vect_or_engine_cli`) and plain `cargo build` | `cargo build` | No |
+
+The `napi_*` symbols exist only inside a running Node.js process, so keeping them out of the default build lets the CLI link on Linux (checked by the `Rust` CI workflow on ubuntu-latest).
 
 ---
 
