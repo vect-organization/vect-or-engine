@@ -7,6 +7,11 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [Unreleased]
+
+### Fixed
+- `cargo build` failed on Linux: the CLI binary linked the N-API bindings, whose `napi_*` symbols only exist inside Node.js. The bindings moved to `src/napi_bindings.rs` behind a new `napi` Cargo feature; `npm run build` / `build:debug` pass `--features napi` (Cargo.toml, lib.rs, package.json)
+
 ## [0.3.5] - 2026-10-01
 
 ### Fixed
