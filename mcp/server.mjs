@@ -45,6 +45,30 @@ if (!engine) {
   process.exit(1);
 }
 
+// ─── JSON-RPC errors ──────────────────────────────────────────────────────────
+
+// Errors caused by the request; their message is safe to return to the client
+class RpcError extends Error {
+  constructor(rpcCode, message) {
+    super(message);
+    this.rpcCode = rpcCode; // not `code`: engine errors use code = 'InvalidArg' (a string)
+  }
+}
+
+// Engine errors marked InvalidArg carry messages written for the caller
+// (invalid path, vector dimension mismatch); everything else stays internal
+function toRpcError(err) {
+  if (err instanceof RpcError) return { code: err.rpcCode, message: err.message };
+  if (err?.code === 'InvalidArg') return { code: -32602, message: String(err.message) };
+  console.error('[MCP] Request handling error:', err?.stack ?? err);
+  return { code: -32603, message: 'Internal error' };
+}
+
+function sendRpc(res, payload) {
+  res.writeHead(200); // JSON-RPC always 200
+  res.end(JSON.stringify(payload));
+}
+
 // ─── JSON-RPC dispatcher ──────────────────────────────────────────────────────
 
 async function dispatch(method, params) {
@@ -55,7 +79,7 @@ async function dispatch(method, params) {
 
     case 'load': {
       const kbPath = params?.path;
-      if (!kbPath) throw new Error('Missing param: path');
+      if (!kbPath) throw new RpcError(-32602, 'Missing param: path');
       const fn = engine.loadKnowledgeBase ?? engine.load_knowledge_base;
       if (!fn) throw new Error('Engine method loadKnowledgeBase not found');
       const count = await fn.call(engine, kbPath);
@@ -71,7 +95,7 @@ async function dispatch(method, params) {
 
     case 'search': {
       if (!params?.vector || !Array.isArray(params.vector)) {
-        throw new Error('Missing or invalid param: vector (must be number[])');
+        throw new RpcError(-32602, 'Missing or invalid param: vector (must be number[])');
       }
       const topK = typeof params.top_k === 'number' ? params.top_k : 5;
       const floatVec = new Float32Array(params.vector);
@@ -96,7 +120,7 @@ async function dispatch(method, params) {
     }
 
     default:
-      throw new Error(`Unknown method: ${method}`);
+      throw new RpcError(-32601, `Unknown method: ${method}`);
   }
 }
 
@@ -124,20 +148,24 @@ const server = http.createServer(async (req, res) => {
   let body = '';
   for await (const chunk of req) body += chunk;
 
-  let id = null;
+  let request;
   try {
-    const { id: reqId, method, params } = JSON.parse(body);
-    id = reqId ?? null;
-    const result = await dispatch(method, params ?? {});
-    res.writeHead(200);
-    res.end(JSON.stringify({ jsonrpc: '2.0', id, result }));
+    request = JSON.parse(body);
+  } catch {
+    sendRpc(res, { jsonrpc: '2.0', id: null, error: { code: -32700, message: 'Parse error' } });
+    return;
+  }
+  if (!request || typeof request !== 'object' || Array.isArray(request)) {
+    sendRpc(res, { jsonrpc: '2.0', id: null, error: { code: -32600, message: 'Invalid Request' } });
+    return;
+  }
+
+  const id = request.id ?? null;
+  try {
+    const result = await dispatch(request.method, request.params ?? {});
+    sendRpc(res, { jsonrpc: '2.0', id, result });
   } catch (err) {
-    res.writeHead(200); // JSON-RPC always 200
-    res.end(JSON.stringify({
-      jsonrpc: '2.0',
-      id,
-      error: { code: -32603, message: String(err?.message ?? err) }
-    }));
+    sendRpc(res, { jsonrpc: '2.0', id, error: toRpcError(err) });
   }
 });
 

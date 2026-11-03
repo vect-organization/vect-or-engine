@@ -13,6 +13,9 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 - `cargo build` failed on Linux: the CLI binary linked the N-API bindings, whose `napi_*` symbols only exist inside Node.js. The bindings moved to `src/napi_bindings.rs` behind a new `napi` Cargo feature; `npm run build` / `build:debug` pass `--features napi` (Cargo.toml, lib.rs, package.json)
 - `package-lock.json` still said 0.3.0; now matches the package version
 
+### Security
+- MCP server (`mcp/server.mjs`) returned `String(err?.message ?? err)` for every failure, which could expose internal error details (CodeQL `js/stack-trace-exposure`, alert #1). Errors are now classified per JSON-RPC 2.0: parse error -32700, invalid request -32600 (non-object, `null`, batch array), unknown method -32601, bad params and engine `InvalidArg` errors -32602 with their message; anything else returns -32603 `Internal error` and the details go to the server log only
+
 ### Added
 - `Rust` CI workflow: `cargo build` and `cargo test` on ubuntu-latest (`.github/workflows/rust.yml`)
 
