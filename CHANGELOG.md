@@ -7,10 +7,24 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
-## [Unreleased]
+## [0.3.6] - 2026-11-03
 
 ### Fixed
 - `cargo build` failed on Linux: the CLI binary linked the N-API bindings, whose `napi_*` symbols only exist inside Node.js. The bindings moved to `src/napi_bindings.rs` behind a new `napi` Cargo feature; `npm run build` / `build:debug` pass `--features napi` (Cargo.toml, lib.rs, package.json)
+- `package-lock.json` still said 0.3.0; now matches the package version
+
+### Security
+- MCP server (`mcp/server.mjs`) returned `String(err?.message ?? err)` for every failure, which could expose internal error details (CodeQL `js/stack-trace-exposure`, alert #1). Errors are now classified per JSON-RPC 2.0: parse error -32700, invalid request -32600 (non-object, `null`, batch array), unknown method -32601, bad params and engine `InvalidArg` errors -32602 with their message; anything else returns -32603 `Internal error` and the details go to the server log only
+
+### Added
+- `Rust` CI workflow: `cargo build` and `cargo test` on ubuntu-latest (`.github/workflows/rust.yml`)
+
+### Documentation
+- README: project structure shows the core / `napi` split and which build targets include N-API
+- README: VectOrEdit link fixed (was a 404), demo replaced with the VectOrEdit v0.3.56 GIF, and the integration text lists the calls VectOrEdit actually makes
+- README: badges match the facts (live Rust CI badge; `.node` is built for Windows x64 only; security badge points to the notes); the security section adds the 5 `unsafe` blocks and the unauthenticated MCP server that the 2026-09-14 audit did not cover
+- README: CLI section documents the stdin JSON-RPC format, Linux support, out-of-order responses and the exit-on-EOF behaviour
+- README: MCP section warns that the server has no request gate yet (no authentication, no limit on `load` paths) and lists its JSON-RPC error codes; the gate is developed on the `feat/mcp-request-gate` branch, not in this release
 
 ## [0.3.5] - 2026-10-01
 
