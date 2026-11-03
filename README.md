@@ -93,7 +93,7 @@ npm install
 npm run build
 ```
 
-*(Note: Running `cargo build --release` compiles the standard Rust rlib/cdylib, while `npm run build` generates the required Node.js `.node` addon binding.)*
+*(Note: The N-API bindings sit behind the `napi` Cargo feature. `npm run build` passes `--features napi` and generates the Node.js `.node` addon. A plain `cargo build` compiles the core engine and the CLI without N-API, so it links on any platform.)*
 
 ### Run Standalone CLI Binary
 
@@ -107,8 +107,11 @@ cargo run --bin vect_or_engine_cli
 ### Running Tests
 
 ```bash
-# Run Rust unit & integration tests
+# Run Rust unit & integration tests (core engine)
 cargo test
+
+# Also run the N-API binding unit tests (checked on Windows)
+cargo test --features napi
 
 # Run Node.js N-API binding integration tests
 npm test

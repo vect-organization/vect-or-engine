@@ -17,10 +17,14 @@ crate-type = ["cdylib", "rlib"]
 name = "vect_or_engine_cli"
 path = "src/main.rs"
 
+[features]
+default = []
+napi = ["dep:napi", "dep:napi-derive"]
+
 [dependencies]
-# N-API bindings
-napi = { version = "2", default-features = false, features = ["napi4", "tokio_rt", "serde-json"] }
-napi-derive = "2"
+# N-API bindings (only with --features napi; the CLI and CI cargo builds stay free of napi_* symbols)
+napi = { version = "2", optional = true, default-features = false, features = ["napi4", "tokio_rt", "serde-json"] }
+napi-derive = { version = "2", optional = true }
 
 anyhow = "1.0"
 once_cell = "1.19"
