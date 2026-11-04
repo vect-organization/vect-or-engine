@@ -57,7 +57,7 @@
     "@types/node": "^18.19.3"
   },
   "engines": {
-    "node": ">= 18"
+    "node": ">= 24"
   },
   "scripts": {
     "test": "node test/test-napi.js",
@@ -65,6 +65,7 @@
     "artifacts": "napi artifacts",
     "build": "napi build --platform --release --features napi",
     "build:debug": "napi build --platform --features napi",
-    "version": "napi version"
+    "version": "napi version",
+    "check:engine": "node scripts/engine-build-check.mjs"
   }
 }
