@@ -5,6 +5,16 @@ recall@10 measurements of the HNSW index in `src/hnsw_index.rs`. It explains whi
 is used as the reference, why repeated runs give the same recall, and what the measurements do
 and do not show.
 
+## At a glance
+
+![Recall@10: previous default vs current default](results/recall_before_after.svg)
+
+- **Result**: the current default raises recall@10 on clustered data from 0.66 to 0.999 at 10,000 vectors, and on uniform data from 0.26 to 0.48.
+- **Reproducible**: the same configuration gives identical recall in every repeated run (four runs at 384 dimensions, two at 768).
+- **Limit**: the data are synthetic. Query speed varies too much between runs to report as a number.
+
+**Contents**: [0. Findings](#0-findings-summary) · [3. Method](#3-method) · [5. Results](#5-results) · [6. How to reproduce](#6-how-to-reproduce) · [7. Limitations](#7-limitations)
+
 ## 0. Findings (summary)
 
 This is the summary of the recall investigation. The details are in the sections below.
@@ -176,6 +186,19 @@ heuristic; each node keeps up to 16 links on upper layers and 32 on layer 0; the
 - **Seed**: the starting value of the random generator. The same seed gives the same data every time.
 
 ## 3. Method
+
+The measurement follows the flow below. Random data are quantised, indexed and searched. Each query
+result is compared with an exact search over the original vectors.
+
+```mermaid
+flowchart LR
+    A["Seeded random data<br/>384 or 768 dimensions"] --> B["Quantise f32 to f16"]
+    B --> C["Build HNSW index"]
+    C --> D["Search top 10<br/>1,000 queries"]
+    A --> E["Exact top 10<br/>full scan over f32"]
+    D --> F["Recall@10 = hits / 10,000"]
+    E --> F
+```
 
 The benchmark is `examples/bench.rs`. For each data shape and size it does the following.
 

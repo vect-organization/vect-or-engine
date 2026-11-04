@@ -126,6 +126,41 @@ $svg.Add("</svg>")
 $svgPath = Join-Path $results "recall_by_config.svg"
 $svg | Set-Content -Path $svgPath -Encoding UTF8
 
+# Before / after chart: previous default vs current default, per data set.
+$prevRow = $rows | Where-Object { $_.configuration -eq "Default (previous), efSearch=64" }
+$currRow = $rows | Where-Object { $_.configuration -eq "Heuristic, M0=32, efSearch=64 (reference)" }
+$groupDefs = @(
+    @{ label = "uniform, 1,000 vectors";    key = "uniform_1000" },
+    @{ label = "clustered, 1,000 vectors";  key = "clustered_1000" },
+    @{ label = "uniform, 10,000 vectors";   key = "uniform_10000" },
+    @{ label = "clustered, 10,000 vectors"; key = "clustered_10000" }
+)
+$baW = 1000; $baLeft = 250; $baBarMax = 640; $baTop = 92; $baGroup = 84
+$baH = $baTop + $groupDefs.Count * $baGroup + 24
+$ba = New-Object System.Collections.Generic.List[string]
+$ba.Add("<svg xmlns=""http://www.w3.org/2000/svg"" width=""$baW"" height=""$baH"" viewBox=""0 0 $baW $baH"" font-family=""Arial, Helvetica, sans-serif"" font-size=""13"">")
+$ba.Add("<rect width=""100%"" height=""100%"" fill=""#ffffff""/>")
+$ba.Add("<text x=""20"" y=""30"" font-size=""18"" font-weight=""bold"">Recall@10: previous default vs current default</text>")
+$ba.Add("<text x=""20"" y=""52"" fill=""#555555"">Higher is better. Synthetic data, 384 dimensions, 1,000 queries.</text>")
+$ba.Add("<rect x=""20"" y=""66"" width=""14"" height=""14"" fill=""#9e9e9e""/><text x=""40"" y=""78"">Previous default (nearest-M, M0 = 16)</text>")
+$ba.Add("<rect x=""340"" y=""66"" width=""14"" height=""14"" fill=""#2a9d8f""/><text x=""360"" y=""78"">Current default (heuristic, M0 = 32)</text>")
+for ($i = 0; $i -lt $groupDefs.Count; $i++) {
+    $g = $groupDefs[$i]
+    $y0 = $baTop + $i * $baGroup
+    $pv = [double]$prevRow.($g.key)
+    $cv = [double]$currRow.($g.key)
+    $ba.Add("<text x=""20"" y=""$($y0 + 24)"" font-size=""14"" font-weight=""bold"">$($g.label)</text>")
+    foreach ($bar in @(@{ v = $pv; fill = "#9e9e9e"; dy = 0 }, @{ v = $cv; fill = "#2a9d8f"; dy = 30 })) {
+        $y = $y0 + $bar.dy
+        $w = [math]::Round($bar.v * $baBarMax, 1)
+        $ba.Add("<rect x=""$baLeft"" y=""$y"" width=""$w"" height=""22"" fill=""$($bar.fill)""/>")
+        $ba.Add("<text x=""$($baLeft + $w + 6)"" y=""$($y + 16)"">" + ("{0:N4}" -f $bar.v) + "</text>")
+    }
+}
+$ba.Add("</svg>")
+$baPath = Join-Path $results "recall_before_after.svg"
+$ba | Set-Content -Path $baPath -Encoding UTF8
+
 Write-Host "wrote $csv"
 Write-Host "wrote $mdPath"
 Write-Host "wrote $svgPath"
