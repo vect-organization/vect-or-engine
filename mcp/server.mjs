@@ -248,4 +248,7 @@ const server = http.createServer(async (req, res) => {
 server.listen(PORT, '127.0.0.1', () => {
   console.log(`[MCP] vect-or-engine MCP server listening on http://127.0.0.1:${PORT}/mcp`);
   console.log('[MCP] Methods: ping | load | build | search | validate | kb_info');
+  if (!MCP_AUTH_TOKEN) {
+    console.warn('[MCP] WARNING: MCP_AUTH_TOKEN is not set; requests are accepted without a bearer token. Set it to require "Authorization: Bearer <token>".');
+  }
 });

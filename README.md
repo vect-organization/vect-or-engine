@@ -103,10 +103,10 @@ The `napi_*` symbols exist only inside a running Node.js process, so keeping the
 
 ### Prerequisites
 
-[![Rust](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1abcdefggs%2Fvect-or-engine%2Fmain%2F.github%2Fbadges%2Frust.json&style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/) [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/) [![Platform: .node Windows x64, core and CLI Windows and Linux](https://img.shields.io/badge/platform-.node%3A%20Windows%20x64%20%7C%20core%2FCLI%3A%20Windows%2C%20Linux-lightgrey?style=flat-square)](#getting-started)
+[![Rust](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1abcdefggs%2Fvect-or-engine%2Fmain%2F.github%2Fbadges%2Frust.json&style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/) [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D24-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/) [![Platform: .node Windows x64, core and CLI Windows and Linux](https://img.shields.io/badge/platform-.node%3A%20Windows%20x64%20%7C%20core%2FCLI%3A%20Windows%2C%20Linux-lightgrey?style=flat-square)](#getting-started)
 
 - [Rust](https://www.rust-lang.org/) (2021 edition, `cargo` v1.75+)
-- [Node.js](https://nodejs.org/) (v18+)
+- [Node.js](https://nodejs.org/) (v24+)
 
 ### Build Native Addon (N-API)
 

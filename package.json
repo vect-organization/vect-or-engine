@@ -57,7 +57,7 @@
     "@types/node": "^18.19.3"
   },
   "engines": {
-    "node": ">= 18"
+    "node": ">= 24"
   },
   "scripts": {
     "test": "node test/test-napi.js",
