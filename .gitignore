@@ -47,3 +47,5 @@ _domain-modeling/
 CODE_REVIEW/
 _ARCHIVE_REVIEWS/
 docs/_ARCHIVE_REVIEWS/
+# Internal working records (not published with the repository)
+docs/
