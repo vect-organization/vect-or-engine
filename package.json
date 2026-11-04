@@ -65,6 +65,7 @@
     "artifacts": "napi artifacts",
     "build": "napi build --platform --release --features napi",
     "build:debug": "napi build --platform --features napi",
-    "version": "napi version"
+    "version": "napi version",
+    "check:engine": "node scripts/engine-build-check.mjs"
   }
 }

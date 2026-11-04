@@ -32,6 +32,9 @@ jobs:
       - name: Build Native Addon (.node)
         run: npm run build
 
+      - name: Check engine build matches HEAD
+        run: npm run check:engine
+
       - name: Run Test Suite
         run: |
           cargo test --quiet
