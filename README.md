@@ -3,14 +3,7 @@
 > **High-Performance Rust-Powered Vector Indexing (HNSW) & Semantic Validation Engine**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-[![npm](https://img.shields.io/badge/npm-%401abcdefggs%2Fvect--or--engine-CB3837?style=flat-square&logo=npm)](https://github.com/1abcdefggs/vect-or-engine/packages)
-[![Version: v0.3.7](https://img.shields.io/badge/version-0.3.7-indigo?style=flat-square)](package.json)
-[![Rust](https://img.shields.io/badge/Rust-2021_Edition-DEA584?style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![N-API](https://img.shields.io/badge/N--API-Native_Addon-green?style=flat-square&logo=cplusplus&logoColor=white)](https://napi.rs/)
-[![Rust CI](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml)
-[![Security: audit 2026-09-14, see notes](https://img.shields.io/badge/security-audit%202026--09--14%2C%20see%20notes-yellow?style=flat-square)](#security--audit)
-[![Platform: .node Windows x64, core and CLI Windows and Linux](https://img.shields.io/badge/platform-.node%3A%20Windows%20x64%20%7C%20core%2FCLI%3A%20Windows%2C%20Linux-lightgrey?style=flat-square)](#getting-started)
+[![Version](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1abcdefggs%2Fvect-or-engine%2Fmain%2F.github%2Fbadges%2Fversion.json&style=flat-square)](package.json)
 
 **VectOrEngine** is a lightweight, ultra-high-performance native semantic computation engine crafted in Rust. Engineered specifically as the **core native backend** for desktop editors and local-first AI runtimes, it delivers **HNSW vector similarity search (SIMD)** with measured recall ([see Search quality](#search-quality-recall)), **real-time schema-driven static linting**, and **zero-copy memory-mapped knowledge management** via direct in-memory Node.js/Electron N-API bindings.
 
@@ -110,10 +103,14 @@ The `napi_*` symbols exist only inside a running Node.js process, so keeping the
 
 ### Prerequisites
 
+[![Rust](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1abcdefggs%2Fvect-or-engine%2Fmain%2F.github%2Fbadges%2Frust.json&style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/) [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/) [![Platform: .node Windows x64, core and CLI Windows and Linux](https://img.shields.io/badge/platform-.node%3A%20Windows%20x64%20%7C%20core%2FCLI%3A%20Windows%2C%20Linux-lightgrey?style=flat-square)](#getting-started)
+
 - [Rust](https://www.rust-lang.org/) (2021 edition, `cargo` v1.75+)
 - [Node.js](https://nodejs.org/) (v18+)
 
 ### Build Native Addon (N-API)
+
+[![N-API](https://img.shields.io/badge/N--API-Native_Addon-green?style=flat-square&logo=cplusplus&logoColor=white)](https://napi.rs/)
 
 To build the native `.node` binary for Node.js / Electron:
 
@@ -171,6 +168,8 @@ Errors follow JSON-RPC 2.0: -32700 parse error, -32600 invalid request, -32601 u
 ---
 
 ## Installation in Electron / Node.js Apps
+
+[![npm](https://img.shields.io/badge/npm-%401abcdefggs%2Fvect--or--engine-CB3837?style=flat-square&logo=npm)](https://github.com/1abcdefggs/vect-or-engine/packages)
 
 To integrate VectOrEngine into your desktop editor (e.g., `vect-or-edit`):
 
@@ -238,6 +237,10 @@ console.log("Vector Recommendations:", results);
 ---
 
 ## Security & Audit
+
+[![Rust CI](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml)
+[![CodeQL](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/dynamic/github-code-scanning/codeql/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/security/code-scanning)
+[![Security: audit 2026-09-14, see notes](https://img.shields.io/badge/security-audit%202026--09--14%2C%20see%20notes-yellow?style=flat-square)](#security--audit)
 
 A static and dynamic security audit on 2026-09-14 rated VectOrEngine **A+**. Its findings:
 - **Zero Supply-Chain Vulnerabilities**: Zero runtime npm package dependencies. `npm audit` returned 0 vulnerabilities.
