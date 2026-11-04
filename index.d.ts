@@ -5,6 +5,22 @@
 
 /** A simple ping function to verify the NAPI setup. */
 export declare function ping(name: string): string
+/** Build metadata baked in at compile time (see build.rs). */
+export interface JsBuildInfo {
+  /** Crate version from Cargo.toml. */
+  version: string
+  /** Short git commit hash, or "unknown" when git was unavailable at build time. */
+  gitHash: string
+  /**
+   * "true" when the working tree had uncommitted or untracked changes at build time,
+   * "false" when clean, "unknown" when git was unavailable.
+   */
+  gitDirty: string
+  /** Build time in UNIX seconds. */
+  builtAtUnix: number
+}
+/** Returns the version, git hash, dirty flag and build time of this native binary. */
+export declare function buildInfo(): JsBuildInfo
 export interface JsValidationMarker {
   line: number
   severity: string

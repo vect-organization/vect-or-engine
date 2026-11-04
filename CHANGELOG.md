@@ -7,6 +7,13 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ---
 
+## [0.3.7] - 2026-11-04
+
+### Added
+- `buildInfo()` returns `{ version, gitHash, gitDirty, builtAtUnix }` so a `.node` file can be traced to the build that produced it. `build.rs` embeds the short git hash (`unknown` without git), whether the working tree had uncommitted changes (`"true"` / `"false"` / `"unknown"`), and the build time in UNIX seconds. The build reruns when sources, `Cargo.toml` or git HEAD change
+
+---
+
 ## [0.3.6] - 2026-11-03
 
 ### Fixed
