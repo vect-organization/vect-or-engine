@@ -1,0 +1,46 @@
+name: Badge metadata
+
+# Keeps the version and Rust edition badges in the README in step with Cargo.toml.
+# Runs only when Cargo.toml changes on main, and commits the generated JSON
+# files that shields.io reads. A commit made with GITHUB_TOKEN does not start
+# new workflow runs, and the paths filter excludes the badge files, so this
+# cannot loop.
+
+on:
+  push:
+    branches: [ main ]
+    paths:
+      - Cargo.toml
+
+permissions:
+  contents: write
+
+jobs:
+  update-badges:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Write badge JSON from Cargo.toml
+        run: |
+          set -euo pipefail
+          VERSION=$(sed -n 's/^version = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          EDITION=$(sed -n 's/^edition = "\(.*\)"/\1/p' Cargo.toml | head -1)
+          test -n "$VERSION"
+          test -n "$EDITION"
+          mkdir -p .github/badges
+          printf '{"schemaVersion":1,"label":"version","message":"%s","color":"indigo"}\n' "$VERSION" > .github/badges/version.json
+          printf '{"schemaVersion":1,"label":"Rust","message":"%s Edition","color":"DEA584"}\n' "$EDITION" > .github/badges/rust.json
+
+      - name: Commit if changed
+        run: |
+          set -euo pipefail
+          git config user.name "github-actions[bot]"
+          git config user.email "41898282+github-actions[bot]@users.noreply.github.com"
+          git add .github/badges
+          if git diff --cached --quiet; then
+            echo "Badge metadata is already up to date."
+            exit 0
+          fi
+          git commit -m "chore(badges): update version and edition metadata"
+          git push origin HEAD:main

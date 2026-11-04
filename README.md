@@ -3,16 +3,9 @@
 > **High-Performance Rust-Powered Vector Indexing (HNSW) & Semantic Validation Engine**
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-[![npm](https://img.shields.io/badge/npm-%401abcdefggs%2Fvect--or--engine-CB3837?style=flat-square&logo=npm)](https://github.com/1abcdefggs/vect-or-engine/packages)
-[![Version: v0.3.7](https://img.shields.io/badge/version-0.3.7-indigo?style=flat-square)](package.json)
-[![Rust](https://img.shields.io/badge/Rust-2021_Edition-DEA584?style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/)
-[![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/)
-[![N-API](https://img.shields.io/badge/N--API-Native_Addon-green?style=flat-square&logo=cplusplus&logoColor=white)](https://napi.rs/)
-[![Rust CI](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml)
-[![Security: audit 2026-09-14, see notes](https://img.shields.io/badge/security-audit%202026--09--14%2C%20see%20notes-yellow?style=flat-square)](#security--audit)
-[![Platform: .node Windows x64, core and CLI Windows and Linux](https://img.shields.io/badge/platform-.node%3A%20Windows%20x64%20%7C%20core%2FCLI%3A%20Windows%2C%20Linux-lightgrey?style=flat-square)](#getting-started)
+[![Version](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1abcdefggs%2Fvect-or-engine%2Fmain%2F.github%2Fbadges%2Fversion.json&style=flat-square)](package.json)
 
-**VectOrEngine** is a lightweight, ultra-high-performance native semantic computation engine crafted in Rust. Engineered specifically as the **core native backend** for desktop editors and local-first AI runtimes, it delivers **sub-millisecond vector similarity search (HNSW + SIMD)**, **real-time schema-driven static linting**, and **zero-copy memory-mapped knowledge management** via direct in-memory Node.js/Electron N-API bindings.
+**VectOrEngine** is a lightweight, ultra-high-performance native semantic computation engine crafted in Rust. Engineered specifically as the **core native backend** for desktop editors and local-first AI runtimes, it delivers **HNSW vector similarity search (SIMD)** with measured recall ([see Search quality](#search-quality-recall)), **real-time schema-driven static linting**, and **zero-copy memory-mapped knowledge management** via direct in-memory Node.js/Electron N-API bindings.
 
 > 💡 **Dedicated Native Engine for VectOrEdit**:  
 > **VectOrEngine** is not an editor itself — it is the **pure native engine** purposefully designed to empower **[VectOrEdit](https://github.com/1abcdefggs/vect-or-edit)** (our Electron desktop editor). Loaded into VectOrEdit's main process via N-API, it runs the real-time guideline linter (`loadProfile`, `validateSync`) and the knowledge-base vector search behind <kbd>Alt</kbd>+<kbd>S</kbd> (`loadKnowledgeBase`, `buildIndex`, `search`), keeping user documents 100% offline and private.
@@ -34,7 +27,7 @@
 
 ## Key Features
 
-- **Hierarchical Navigable Small World (HNSW)**: $O(\log N)$ approximate nearest neighbor cosine similarity search with SIMD auto-vectorization ($M=16, efConstruction=64, efSearch=32$).
+- **Hierarchical Navigable Small World (HNSW)**: $O(\log N)$ approximate nearest neighbor cosine similarity search with SIMD auto-vectorization (heuristic neighbour selection; $M=16$, $M_0=32$, $efConstruction=200$, $efSearch=64$).
 - **SearchQuery Parameter Bundle**: Structured, type-safe query formulation with top-k limits, slot routing, and minimum similarity threshold filtering.
 - **Fast Warm-Restarts with SQLite Cache**: `saveKbCache` and `loadKbCache` eliminate JSON re-parsing and re-quantization on subsequent app launches.
 - **Schema-Driven Real-Time Linter**: Document validation and clinical/editorial conflict detection powered by `aho-corasick` and regular expressions (`loadProfile`, `validateSync`, `validate`).
@@ -46,6 +39,26 @@
 - **Standalone CLI Binary**: Headless `vect_or_engine_cli` for terminal-based and non-Node.js pipeline integrations.
 
 ---
+
+## Search quality (recall)
+
+Recall@10 is the fraction of the true top 10 nearest vectors that the index returns. Higher is better.
+The values below come from synthetic data (random or clustered vectors, 384 dimensions, 1,000 queries).
+They are not measured on real sentence embeddings.
+
+| Data | Previous default | Current default |
+| :--- | ---: | ---: |
+| uniform, 1,000 vectors | 0.8374 | **0.9751** |
+| clustered, 1,000 vectors | 0.6227 | **0.9998** |
+| uniform, 10,000 vectors | 0.2629 | **0.4786** |
+| clustered, 10,000 vectors | 0.6558 | **0.9990** |
+
+The current default uses heuristic neighbour selection, with M = 16 and M0 = 32 links on layer 0.
+Uniform vectors point in random directions, so they are the hardest case for graph search. Recall stays
+at about 0.48 at 10,000 vectors. Dimension 768 was also measured: uniform 0.385, clustered 0.999.
+
+Query speed is not stated here, because it varies between runs on the same machine.
+The full procedure, reports and reproduction script are in [verification/recall](verification/recall/README.md).
 
 ## Project Structure
 
@@ -90,10 +103,14 @@ The `napi_*` symbols exist only inside a running Node.js process, so keeping the
 
 ### Prerequisites
 
+[![Rust](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1abcdefggs%2Fvect-or-engine%2Fmain%2F.github%2Fbadges%2Frust.json&style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/) [![Node.js](https://img.shields.io/badge/Node.js-%3E%3D18-339933?style=flat-square&logo=nodedotjs&logoColor=white)](https://nodejs.org/) [![Platform: .node Windows x64, core and CLI Windows and Linux](https://img.shields.io/badge/platform-.node%3A%20Windows%20x64%20%7C%20core%2FCLI%3A%20Windows%2C%20Linux-lightgrey?style=flat-square)](#getting-started)
+
 - [Rust](https://www.rust-lang.org/) (2021 edition, `cargo` v1.75+)
 - [Node.js](https://nodejs.org/) (v18+)
 
 ### Build Native Addon (N-API)
+
+[![N-API](https://img.shields.io/badge/N--API-Native_Addon-green?style=flat-square&logo=cplusplus&logoColor=white)](https://napi.rs/)
 
 To build the native `.node` binary for Node.js / Electron:
 
@@ -156,6 +173,8 @@ Errors follow JSON-RPC 2.0: -32700 parse error, -32600 invalid request, -32601 u
 
 ## Installation in Electron / Node.js Apps
 
+[![npm](https://img.shields.io/badge/npm-%401abcdefggs%2Fvect--or--engine-CB3837?style=flat-square&logo=npm)](https://github.com/1abcdefggs/vect-or-engine/packages)
+
 To integrate VectOrEngine into your desktop editor (e.g., `vect-or-edit`):
 
 ```bash
@@ -200,7 +219,7 @@ if (!lintResult.isValid) {
 const cachePath = './cache/knowledge.sqlite';
 
 try {
-  // Fast path: load cached vectors from SQLite (~10x faster)
+  // Fast path: load cached vectors from SQLite (faster than re-parsing JSON; speed-up not measured)
   const count = await loadKbCache(cachePath);
   console.log(`Loaded ${count} vectors from cache.`);
 } catch {
@@ -222,6 +241,10 @@ console.log("Vector Recommendations:", results);
 ---
 
 ## Security & Audit
+
+[![Rust CI](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml)
+[![CodeQL](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/dynamic/github-code-scanning/codeql/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/security/code-scanning)
+[![Security: audit 2026-09-14, see notes](https://img.shields.io/badge/security-audit%202026--09--14%2C%20see%20notes-yellow?style=flat-square)](#security--audit)
 
 A static and dynamic security audit on 2026-09-14 rated VectOrEngine **A+**. Its findings:
 - **Zero Supply-Chain Vulnerabilities**: Zero runtime npm package dependencies. `npm audit` returned 0 vulnerabilities.

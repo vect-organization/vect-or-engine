@@ -26,6 +26,37 @@ const EF_CONSTRUCTION: usize = 200;
 const EF_SEARCH: usize = 64;
 // mL = 1/ln(M) is computed at runtime in next_layer() since ln() is not const-stable.
 
+/// Index parameters. `Default` reproduces the compiled-in constants above.
+/// Experiments (benchmarks) use `HnswIndex::build_with` / `search_with` to vary them.
+#[derive(Clone, Copy, Debug, PartialEq)]
+pub struct HnswParams {
+    /// Connections per node on upper layers.
+    pub m: usize,
+    /// Connections per node on layer 0 (the classic choice is 2 * m).
+    pub m0: usize,
+    /// Build-time search width.
+    pub ef_construction: usize,
+    /// Query-time search width.
+    pub ef_search: usize,
+    /// Use the diversity heuristic (Malkov & Yashunin, alg. 4) when choosing neighbours.
+    pub heuristic: bool,
+    /// With the heuristic, fill remaining slots with rejected candidates (keepPrunedConnections).
+    pub keep_pruned: bool,
+}
+
+impl Default for HnswParams {
+    fn default() -> Self {
+        HnswParams {
+            m: M,
+            m0: 2 * M,
+            ef_construction: EF_CONSTRUCTION,
+            ef_search: EF_SEARCH,
+            heuristic: true,
+            keep_pruned: true,
+        }
+    }
+}
+
 // ─── Internal heap wrappers ────────────────────────────────────────────────────
 
 /// Min-heap by distance — used for the candidate queue.
@@ -74,22 +105,34 @@ pub struct HnswIndex {
     max_layer: usize,
     /// Simple counter-based seed for deterministic layer assignment.
     rng_state: u64,
+    params: HnswParams,
 }
 
 impl HnswIndex {
-    /// Create an empty index.
+    /// Create an empty index with the default parameters.
     pub fn new() -> Self {
+        Self::with_params(HnswParams::default())
+    }
+
+    /// Create an empty index with the given parameters.
+    pub fn with_params(params: HnswParams) -> Self {
         HnswIndex {
             nodes: Vec::new(),
             entry_point: None,
             max_layer: 0,
             rng_state: 0x9e3779b97f4a7c15,
+            params,
         }
     }
 
     /// Build index from a slice of vectors (sequential; call from `spawn_blocking`).
     pub fn build(vectors: &[Vec<f32>]) -> Self {
-        let mut idx = HnswIndex::new();
+        Self::build_with(HnswParams::default(), vectors)
+    }
+
+    /// Build index with explicit parameters (used by the benchmark).
+    pub fn build_with(params: HnswParams, vectors: &[Vec<f32>]) -> Self {
+        let mut idx = HnswIndex::with_params(params);
         for v in vectors {
             idx.insert(v);
         }
@@ -118,7 +161,7 @@ impl HnswIndex {
         // Geometric distribution: floor(-ln(uniform) / ln(M))
         // mL = 1/ln(M) — computed here since ln() is not const-stable.
         let uniform = (x >> 11) as f64 / (1u64 << 53) as f64; // ∈ (0,1)
-        let ml = 1.0_f64 / (M as f64).ln();
+        let ml = 1.0_f64 / (self.params.m as f64).ln();
         let f = (-uniform.ln() * ml).floor() as usize;
         f.min(32) // cap at 32 layers
     }
@@ -193,6 +236,48 @@ impl HnswIndex {
 
     // ── Insert ────────────────────────────────────────────────────────────────
 
+    /// Maximum neighbours kept on layer `lc` (layer 0 uses `m0`).
+    fn cap_at(&self, lc: usize) -> usize {
+        if lc == 0 { self.params.m0 } else { self.params.m }
+    }
+
+    /// Choose at most `max` neighbours from `cands`, which are `(distance to base, node)`
+    /// pairs sorted by ascending distance.
+    ///
+    /// Without the heuristic this is the nearest `max` candidates. With it, a candidate is
+    /// kept only if it is closer to the base node than to every neighbour already kept;
+    /// rejected candidates fill the remaining slots, so the node keeps `max` links.
+    fn select_neighbours(&self, cands: &[(f32, usize)], max: usize) -> Vec<usize> {
+        if !self.params.heuristic {
+            return cands.iter().take(max).map(|&(_, idx)| idx).collect();
+        }
+        let mut kept: Vec<usize> = Vec::with_capacity(max);
+        let mut rejected: Vec<usize> = Vec::new();
+        for &(d_base, c) in cands {
+            if kept.len() >= max {
+                break;
+            }
+            let c_vec = &self.nodes[c].vector;
+            let diverse = kept
+                .iter()
+                .all(|&s| d_base < Self::dist(c_vec, &self.nodes[s].vector));
+            if diverse {
+                kept.push(c);
+            } else {
+                rejected.push(c);
+            }
+        }
+        if self.params.keep_pruned {
+            for c in rejected {
+                if kept.len() >= max {
+                    break;
+                }
+                kept.push(c);
+            }
+        }
+        kept
+    }
+
     /// Insert one vector into the index; returns the assigned node ID.
     pub fn insert(&mut self, vector: &[f32]) -> usize {
         let node_id = self.nodes.len();
@@ -222,16 +307,16 @@ impl HnswIndex {
 
         // Phase 2: insert with ef_construction at each layer ≤ node_layer.
         for lc in (0..=node_layer.min(top)).rev() {
-            let candidates = self.search_layer(vector, ep, EF_CONSTRUCTION, lc);
+            let cap = self.cap_at(lc);
+            let candidates = self.search_layer(vector, ep, self.params.ef_construction, lc);
 
-            // Select M nearest neighbours.
-            let neighbours: Vec<usize> =
-                candidates.iter().take(M).map(|&(_, idx)| idx).collect();
+            // Select neighbours (nearest first, or the diversity heuristic).
+            let neighbours: Vec<usize> = self.select_neighbours(&candidates, cap);
 
             // Set outgoing edges for new node.
             self.nodes[node_id].layers[lc] = neighbours.clone();
 
-            // Add incoming edges + prune to M if needed.
+            // Add incoming edges + prune to the layer cap if needed.
             for &nb in &neighbours {
                 if lc >= self.nodes[nb].layers.len() {
                     self.nodes[nb].layers.resize(lc + 1, Vec::new());
@@ -239,13 +324,13 @@ impl HnswIndex {
                 let mut conn = self.nodes[nb].layers[lc].clone();
                 conn.push(node_id);
 
-                if conn.len() > M {
+                if conn.len() > cap {
                     let nb_vec = &self.nodes[nb].vector;
                     let mut distances: Vec<(f32, usize)> = conn.iter()
                         .map(|&idx| (Self::dist(nb_vec, &self.nodes[idx].vector), idx))
                         .collect();
                     distances.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
-                    conn = distances.iter().take(M).map(|&(_, idx)| idx).collect();
+                    conn = self.select_neighbours(&distances, cap);
                 }
                 self.nodes[nb].layers[lc] = conn;
             }
@@ -270,6 +355,11 @@ impl HnswIndex {
     ///
     /// Returns `(score, node_id)` pairs sorted by **descending** dot-product score.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(f32, usize)> {
+        self.search_with(query, top_k, self.params.ef_search)
+    }
+
+    /// Search with an explicit query-time width `ef_search` (used by the benchmark).
+    pub fn search_with(&self, query: &[f32], top_k: usize, ef_search: usize) -> Vec<(f32, usize)> {
         let Some(mut ep) = self.entry_point else {
             return vec![];
         };
@@ -283,7 +373,7 @@ impl HnswIndex {
         }
 
         // Full ef-wide search at layer 0.
-        let ef = EF_SEARCH.max(top_k);
+        let ef = ef_search.max(top_k);
         let candidates = self.search_layer(query, ep, ef, 0);
 
         candidates
@@ -337,6 +427,40 @@ mod tests {
         let a = vec![1.0f32, 2.0, 3.0, 4.0, 5.0];
         let b = vec![1.0f32, 0.0, 1.0, 0.0, 1.0];
         assert!((dot_product_simd(&a, &b) - 9.0).abs() < 1e-5);
+    }
+
+    #[test]
+    fn default_params_are_the_reference_configuration() {
+        let p = HnswParams::default();
+        assert_eq!(p.m, 16);
+        assert_eq!(p.m0, 32);
+        assert_eq!(p.ef_construction, 200);
+        assert_eq!(p.ef_search, 64);
+        assert!(p.heuristic);
+        assert!(p.keep_pruned);
+    }
+
+    #[test]
+    fn heuristic_keeps_a_different_direction_and_nearest_does_not() {
+        // Base vector A = (1, 0). B is 8 degrees away, C is 12 degrees (close to B),
+        // D is 30 degrees on the other side of A.
+        let deg = |d: f32| (d.to_radians().cos(), d.to_radians().sin());
+        let (b, c, d) = (deg(8.0), deg(12.0), deg(-30.0));
+        let nodes = [vec![b.0, b.1], vec![c.0, c.1], vec![d.0, d.1]];
+        // Candidates as (distance to A, node) sorted ascending; distance = -dot(A, v).
+        let cands = vec![(-b.0, 0usize), (-c.0, 1usize), (-d.0, 2usize)];
+
+        let mut heur = HnswIndex::with_params(HnswParams { heuristic: true, ..HnswParams::default() });
+        let mut plain = HnswIndex::with_params(HnswParams { heuristic: false, ..HnswParams::default() });
+        for v in &nodes {
+            heur.insert(v);
+            plain.insert(v);
+        }
+
+        // Nearest-M keeps B and C (both on the same side).
+        assert_eq!(plain.select_neighbours(&cands, 2), vec![0, 1]);
+        // The heuristic rejects C (closer to B than to A) and keeps D.
+        assert_eq!(heur.select_neighbours(&cands, 2), vec![0, 2]);
     }
 
     #[test]
