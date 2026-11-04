@@ -310,9 +310,10 @@ if (!nativeBinding) {
   throw new Error(`Failed to load native binding`)
 }
 
-const { ping, validateSync, validate, loadProfile, loadKnowledgeBase, loadKbCache, saveKbCache, buildIndex, search, kbInfo } = nativeBinding
+const { ping, buildInfo, validateSync, validate, loadProfile, loadKnowledgeBase, loadKbCache, saveKbCache, buildIndex, search, kbInfo } = nativeBinding
 
 module.exports.ping = ping
+module.exports.buildInfo = buildInfo
 module.exports.validateSync = validateSync
 module.exports.validate = validate
 module.exports.loadProfile = loadProfile

@@ -39,6 +39,31 @@ pub fn ping(name: String) -> String {
   format!("pong from rust: {name}!")
 }
 
+/// Build metadata baked in at compile time (see build.rs).
+#[napi(object)]
+pub struct JsBuildInfo {
+    /// Crate version from Cargo.toml.
+    pub version: String,
+    /// Short git commit hash, or "unknown" when git was unavailable at build time.
+    pub git_hash: String,
+    /// "true" when the working tree had uncommitted or untracked changes at build time,
+    /// "false" when clean, "unknown" when git was unavailable.
+    pub git_dirty: String,
+    /// Build time in UNIX seconds.
+    pub built_at_unix: f64,
+}
+
+/// Returns the version, git hash, dirty flag and build time of this native binary.
+#[napi]
+pub fn build_info() -> JsBuildInfo {
+    JsBuildInfo {
+        version: env!("CARGO_PKG_VERSION").to_string(),
+        git_hash: env!("VECT_GIT_HASH").to_string(),
+        git_dirty: env!("VECT_GIT_DIRTY").to_string(),
+        built_at_unix: env!("VECT_BUILD_UNIX").parse::<f64>().unwrap_or(0.0),
+    }
+}
+
 // --- N-API Data Structures ---
 // These structs mirror the internal engine structs but are annotated for NAPI.
 
