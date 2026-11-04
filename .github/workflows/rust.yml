@@ -19,7 +19,16 @@ jobs:
 
     steps:
     - uses: actions/checkout@v4
+      with:
+        # The build-check tests look up older commits in git history
+        fetch-depth: 0
     - name: Build
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Setup Node.js 24
+      uses: actions/setup-node@v4
+      with:
+        node-version: 24
+    - name: Run build-check tests
+      run: node --test test/test-engine-build-check.mjs
