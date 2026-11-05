@@ -21,6 +21,7 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ### Changed
 - `engines.node` is `>= 24` (was `>= 18`, end of life); README Node.js requirement updated
+- Removed the `Badge metadata` workflow and `.github/badges/`: its push to `main` is refused by the branch rule ("Changes must be made through a pull request", first run after PR #33). The README version badge reads `package.json` directly and the Rust edition badge is static
 
 ### Documentation
 - README: security section lists the facts checked on 2026-11-05 instead of the 2026-09-14 rating; project structure, test commands, `buildInfo` and `matchMode` usage, GitHub Packages `.npmrc`, and a real-data recall check added
