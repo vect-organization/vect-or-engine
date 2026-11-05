@@ -1,9 +1,12 @@
-// Tests for scripts/engine-build-check.mjs. Uses this repository's real git history:
-// db1cadd is an ancestor of HEAD with no engine input changed; 79304e9 is older and before
-// the HNSW change (src/ changed since). Run: node --test test/test-engine-build-check.mjs
+// Tests for scripts/engine-build-check.mjs. The ok, stale-source and stale cases use this
+// repository's real git history (79304e9 is older and before the HNSW change, so src/ changed
+// since). The warn case builds a throwaway git repository, so it does not depend on whether
+// the real history changed src/ lately. Run: node --test test/test-engine-build-check.mjs
 import { test } from 'node:test';
 import assert from 'node:assert/strict';
 import { execFileSync } from 'node:child_process';
+import fs from 'node:fs';
+import os from 'node:os';
 import path from 'node:path';
 import { fileURLToPath } from 'node:url';
 import { checkEngineBuild } from '../scripts/engine-build-check.mjs';
@@ -24,7 +27,22 @@ test('binary built from HEAD but sources edited after the build is stale-source'
 });
 
 test('older binary whose commits changed no engine input is warn', () => {
-  assert.equal(run(info('db1cadd')).status, 'warn');
+  const dir = fs.mkdtempSync(path.join(os.tmpdir(), 'engine-build-check-'));
+  try {
+    const g = (...args) => execFileSync('git', ['-c', 'user.name=t', '-c', 'user.email=t@example.com', ...args], { cwd: dir, encoding: 'utf8' }).trim();
+    g('init', '-q');
+    fs.mkdirSync(path.join(dir, 'src'));
+    fs.writeFileSync(path.join(dir, 'src', 'a.rs'), 'fn a() {}' + String.fromCharCode(10));
+    g('add', '.');
+    g('commit', '-q', '-m', 'engine input');
+    const built = g('rev-parse', 'HEAD').slice(0, 7);
+    fs.writeFileSync(path.join(dir, 'NOTES.md'), 'no engine input here' + String.fromCharCode(10));
+    g('add', '.');
+    g('commit', '-q', '-m', 'docs only');
+    assert.equal(checkEngineBuild({ repoRoot: dir, buildInfo: info(built) }).status, 'warn');
+  } finally {
+    fs.rmSync(dir, { recursive: true, force: true });
+  }
 });
 
 test('older binary across an engine input change is stale', () => {
