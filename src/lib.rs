@@ -8,6 +8,7 @@
 #![deny(clippy::all)]
 
 pub mod engine_error;
+pub mod limits;
 pub mod profile;
 pub mod validator;
 pub mod translator;

@@ -48,7 +48,7 @@ struct EngineState {
 
 impl EngineState {
     fn new(profile: Profile) -> Self {
-        let validator = Validator::new(&profile);
+        let validator = Validator::new(&profile).expect("the default profile has no value regex");
         let translator = Translator::new(&profile);
         EngineState { profile, validator, translator, knowledge_store: KnowledgeStore::new() }
     }
@@ -110,14 +110,17 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
                     Ok(profile) if profile.is_empty() => {
                         RpcResponse::err(Profile::EMPTY_MESSAGE.to_string(), req.id)
                     }
-                    Ok(profile) => {
-                        // Swap rules only; keep the loaded KB / index (was reset by EngineState::new).
-                        let mut s = state.write().await;
-                        s.validator = Validator::new(&profile);
-                        s.translator = Translator::new(&profile);
-                        s.profile = profile;
-                        RpcResponse::ok(serde_json::json!({"loaded":true,"path":path}), req.id)
-                    }
+                    Ok(profile) => match Validator::new(&profile) {
+                        Err(e) => RpcResponse::err(e, req.id),
+                        Ok(validator) => {
+                            // Swap rules only; keep the loaded KB / index (was reset by EngineState::new).
+                            let mut s = state.write().await;
+                            s.validator = validator;
+                            s.translator = Translator::new(&profile);
+                            s.profile = profile;
+                            RpcResponse::ok(serde_json::json!({"loaded":true,"path":path}), req.id)
+                        }
+                    },
                 },
             }
         }
@@ -211,6 +214,9 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
             };
             let query: Vec<f32> = vec_arr.iter()
                 .filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            if let Err(e) = KnowledgeStore::check_finite_query(&query) {
+                return RpcResponse::from_engine_err(e, req.id);
+            }
             let s = state.read().await;
             if s.knowledge_store.is_empty() {
                 return RpcResponse::err("Knowledge base empty. Call load_knowledge_base first.", req.id);

@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 // https://github.com/1abcdefggs/vect-or-engine
 
+#![forbid(unsafe_code)]
+
 //! Hierarchical Navigable Small World (HNSW) index — Phase 3.
 //!
 //! Provides O(log N) approximate nearest-neighbor search.
@@ -11,7 +13,7 @@
 //! Design decisions:
 //! - Pure Rust, zero external ANN crates (no FFI dependencies).
 //! - Negative dot-product as distance (HNSW minimises; caller maximises similarity).
-//! - SIMD-friendly 4-way unrolled dot product — compiler auto-vectorises with -O3.
+//! - Safe 8-wide chunked dot product — the compiler vectorises it at the target's baseline (SSE2 by default).
 //! - `select_nth_unstable` for O(N) top-K without full sort.
 
 use std::cmp::Ordering;
@@ -70,7 +72,7 @@ impl PartialOrd for MinCand {
 impl Ord for MinCand {
     // Inverted so BinaryHeap becomes min-heap.
     fn cmp(&self, o: &Self) -> Ordering {
-        o.0.partial_cmp(&self.0).unwrap_or(Ordering::Equal)
+        o.0.total_cmp(&self.0)
     }
 }
 
@@ -84,7 +86,7 @@ impl PartialOrd for MaxCand {
 }
 impl Ord for MaxCand {
     fn cmp(&self, o: &Self) -> Ordering {
-        self.0.partial_cmp(&o.0).unwrap_or(Ordering::Equal)
+        self.0.total_cmp(&o.0)
     }
 }
 
@@ -230,7 +232,7 @@ impl HnswIndex {
         // Collect and sort ascending by distance.
         let mut result: Vec<(f32, usize)> =
             window.into_iter().map(|x| (x.0, x.1)).collect();
-        result.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+        result.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
         result
     }
 
@@ -329,7 +331,7 @@ impl HnswIndex {
                     let mut distances: Vec<(f32, usize)> = conn.iter()
                         .map(|&idx| (Self::dist(nb_vec, &self.nodes[idx].vector), idx))
                         .collect();
-                    distances.sort_unstable_by(|a, b| a.0.partial_cmp(&b.0).unwrap_or(Ordering::Equal));
+                    distances.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
                     conn = self.select_neighbours(&distances, cap);
                 }
                 self.nodes[nb].layers[lc] = conn;
@@ -386,32 +388,24 @@ impl HnswIndex {
 
 // ─── SIMD-friendly dot product ────────────────────────────────────────────────
 
-/// 4-way unrolled dot product.  With `opt-level=3` + `lto="fat"` the compiler
-/// will auto-vectorise this into SIMD (SSE / AVX / AVX-512 depending on CPU).
+/// Dot product in safe Rust: 8 independent accumulators over fixed-size chunks (no bounds
+/// checks in the hot loop), then a scalar tail. With `opt-level=3` the compiler vectorises
+/// it at the build target's baseline (SSE2 unless `target-cpu` is raised).
 #[inline(always)]
 pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
     let n = a.len().min(b.len());
-    let mut s0 = 0.0f32;
-    let mut s1 = 0.0f32;
-    let mut s2 = 0.0f32;
-    let mut s3 = 0.0f32;
-
-    let chunks = n / 4;
-    for i in 0..chunks {
-        let base = i * 4;
-        // Safety: base + 3 < n because chunks = n/4.
-        unsafe {
-            s0 += a.get_unchecked(base)     * b.get_unchecked(base);
-            s1 += a.get_unchecked(base + 1) * b.get_unchecked(base + 1);
-            s2 += a.get_unchecked(base + 2) * b.get_unchecked(base + 2);
-            s3 += a.get_unchecked(base + 3) * b.get_unchecked(base + 3);
+    let (a, b) = (&a[..n], &b[..n]);
+    let mut acc = [0.0f32; 8];
+    let mut ca = a.chunks_exact(8);
+    let mut cb = b.chunks_exact(8);
+    for (x, y) in (&mut ca).zip(&mut cb) {
+        for k in 0..8 {
+            acc[k] += x[k] * y[k];
         }
     }
-
-    let mut sum = s0 + s1 + s2 + s3;
-    // Scalar tail.
-    for i in (chunks * 4)..n {
-        unsafe { sum += a.get_unchecked(i) * b.get_unchecked(i); }
+    let mut sum = acc.iter().sum::<f32>();
+    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
+        sum += x * y;
     }
     sum
 }
