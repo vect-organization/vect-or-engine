@@ -28,6 +28,20 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ---
 
+## [0.3.10] - 2026-11-06
+
+Phase C1 of the 0.4.0 work (search core). Change-log rows: `docs/changes/v0.4.0.csv` (P3, P4, R1, R5, A3). Measurements: `verification/phase_c1/`.
+
+### Changed
+- The knowledge base keeps its vectors as exact f32 in one contiguous matrix (`VectorMatrix`) that the exact scan and the HNSW index share (P3). f16 remains only as the SQLite cache format, so a knowledge base loaded from the cache scores slightly differently from the JSON it was saved from. Scores now equal the f32 dot product (A3); expect changes in the last digits against 0.3.9
+- One safe 16-lane dot product (`vect_or_engine::dot`, still exported as `hnsw_index::dot_product_simd`) is used by the exact scan and the index, with a fixed, documented summation order (P4, R5). The `unsafe`-free f16 dot product is gone
+- Equal scores are ordered by index ascending in the exact scan and in the index (R1)
+- Building the index shares the matrix instead of copying it: `index_job()` no longer copies the vectors
+- Rust API: `HnswIndex::build`, `build_with` and `insert` return `Result` (a vector of another length is an error); new `HnswIndex::build_from_matrix`, `VectorMatrix`; the vector is no longer stored per node
+- Measured (this PC, shared and noisy; 10,000 x 384 vectors): the store's exact scan p50 went from 12.5-26.9 ms to 2.7-3.7 ms on one thread, and from 3.2-6.2 ms to 0.67-1.06 ms on 8 threads; index build time 16-30% shorter; recall@10 unchanged (the benchmark no longer rounds through f16, which lifts the clustered figure to 1.0)
+
+---
+
 ## [0.3.9] - 2026-11-06
 
 Phase B of the 0.4.0 work (load safety). Change-log rows: `docs/changes/v0.4.0.csv` (D1, D2, D9, D10, D11, D12, P1).

@@ -22,12 +22,12 @@ A guideline profile (JSON) lists keywords, patterns and thresholds. `loadProfile
 
 ### Finds Related Knowledge Entries by Vector Similarity (HNSW)
 
-A knowledge base is a list of entries with 384-dimensional vectors (the dimension the project's embedding model uses). The engine stores vectors as `f16` (half the memory of `f32`), builds an HNSW graph (heuristic neighbour selection; M = 16, M0 = 32, efConstruction = 200, efSearch = 64) and returns the nearest entries by cosine similarity. Search accuracy is measured in [How accurate the search is](#how-accurate-the-search-is-recall).
+A knowledge base is a list of entries with 384-dimensional vectors (the dimension the project's embedding model uses). The engine keeps vectors as exact `f32` in one contiguous matrix that the exact scan and the HNSW graph share (the SQLite cache stores `f16`), builds an HNSW graph (heuristic neighbour selection; M = 16, M0 = 32, efConstruction = 200, efSearch = 64) and returns the nearest entries by cosine similarity. Search accuracy is measured in [How accurate the search is](#how-accurate-the-search-is-recall).
 
 How the core stores and scans vectors:
 
 - Knowledge files are read once with `fs::read` and parsed (no memory mapping, no `unsafe`); files over 1 GiB are rejected
-- The dot product is safe Rust with 8 independent accumulators over fixed-size chunks; the compiler vectorises it at the build target's baseline (SSE2 unless `target-cpu` is raised)
+- The dot product is safe Rust with 16 independent accumulators over fixed-size chunks and one fixed summation order, used by the exact scan and the index alike; the compiler vectorises it at the build target's baseline (SSE2 unless `target-cpu` is raised)
 - Without an index, or for mid-size data, a parallel linear scan with `rayon` is used
 - The Rust API also has a `SearchQuery` bundle (top-k, minimum similarity threshold, slot routing); the N-API `search` takes only the vector and `topK`
 
@@ -170,7 +170,7 @@ try {
   const count = await loadKbCache(cachePath);
   console.log(`Loaded ${count} vectors from cache.`);
 } catch {
-  // Cold start: parse JSON, quantize to f16 and write the cache
+  // Cold start: parse JSON and write the cache (the cache stores f16)
   await loadKnowledgeBase('./knowledge_base.json');
   await saveKbCache(cachePath);
 }
@@ -338,7 +338,7 @@ vect-or-engine/
     ├── napi_bindings.rs # N-API bindings & Node.js native interface (only with --features napi)
     ├── main.rs         # Headless CLI binary (vect_or_engine_cli), core engine only
     ├── hnsw_index.rs   # HNSW graph indexing & search implementation
-    ├── knowledge_store.rs # Vector quantization (f16) and SQLite store
+    ├── knowledge_store.rs # Knowledge store (shared f32 matrix) and SQLite cache
     ├── validator.rs    # Real-time static linter & rule evaluator
     ├── translator.rs   # Term mapping & colloquial pattern matching
     ├── profile.rs      # Schema-driven profile deserializer
