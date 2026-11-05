@@ -48,4 +48,6 @@ CODE_REVIEW/
 _ARCHIVE_REVIEWS/
 docs/_ARCHIVE_REVIEWS/
 # Internal working records (not published with the repository)
-docs/
+docs/*
+# The change log is public source of truth for each release
+!docs/changes/
