@@ -42,6 +42,9 @@ Phase A of the 0.4.0 work (guard rails). Change-log rows: `docs/changes/v0.4.0.c
 ### Security
 - All `unsafe` code is gone: the dot products are safe 8-lane loops and the knowledge base is read with `fs::read` instead of `mmap`. The six core modules carry `#![forbid(unsafe_code)]`
 - Removed the unused dependencies `anyhow` and `memmap2`, and the unused `serde` feature of `half`
+- Removed `once_cell` (replaced by `std::sync::LazyLock`); `tokio` is now optional and a new default feature `cli` enables the CLI's extra tokio features, so `--no-default-features` builds the core without tokio. tokio is 1.54.1 or later
+- A profile file over 16 MiB is rejected before it is read (CLI and N-API); a knowledge-base file over 1 GiB is rejected
+- README and comments no longer describe `memmap2`, the 4-way unrolled loop or `unsafe` blocks that were removed; `tests/repo_hygiene.rs` guards this and the dependency list
 
 ---
 

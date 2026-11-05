@@ -3,7 +3,7 @@
 use napi_derive::napi;
 use crate::*;
 use napi::bindgen_prelude::*;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -31,8 +31,8 @@ impl Engine {
     }
 }
 
-static ENGINE: Lazy<Arc<RwLock<Engine>>> =
-    Lazy::new(|| Arc::new(RwLock::new(Engine::new(Profile::default()))));
+static ENGINE: LazyLock<Arc<RwLock<Engine>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(Engine::new(Profile::default()))));
 /// A simple ping function to verify the NAPI setup.
 #[napi]
 pub fn ping(name: String) -> String {
@@ -160,6 +160,15 @@ pub async fn load_profile(path: String, match_mode: Option<String>) -> Result<()
             )
         })?,
     };
+    let size = std::fs::metadata(&path)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to read profile: {e}")))?
+        .len();
+    if size > crate::limits::MAX_PROFILE_BYTES as u64 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("Profile is {size} bytes, larger than the {} byte limit", crate::limits::MAX_PROFILE_BYTES),
+        ));
+    }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to read profile: {e}")))?;
     let profile = Profile::load_any_json_str(&content)

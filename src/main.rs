@@ -5,7 +5,7 @@
 //! vect-or-engine -- stdin/stdout JSON-RPC server (Phase 1+3).
 //!
 //! Phase 1: tokio async runtime, mpsc-serialised stdout, Arc<tokio::sync::RwLock>.
-//! Phase 3: KnowledgeStore (memmap2+f16+HNSW), build_index, SQLite cache.
+//! Phase 3: KnowledgeStore (f16 + HNSW), build_index, SQLite cache.
 
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
@@ -103,6 +103,12 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
                 return RpcResponse::from_engine_err(e, req.id);
             }
 
+            let too_big = std::fs::metadata(&path)
+                .map(|m| m.len() > vect_or_engine::limits::MAX_PROFILE_BYTES as u64)
+                .unwrap_or(false);
+            if too_big {
+                return RpcResponse::err(format!("Profile '{path}' is larger than the {} byte limit", vect_or_engine::limits::MAX_PROFILE_BYTES), req.id);
+            }
             match std::fs::read_to_string(&path) {
                 Err(e) => RpcResponse::err(format!("Cannot read '{path}': {e}"), req.id),
                 Ok(content) => match Profile::load_any_json_str(&content) {

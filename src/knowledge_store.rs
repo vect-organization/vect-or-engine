@@ -255,7 +255,7 @@ impl KnowledgeStore {
         self.search_query(&SearchQuery::new(query).with_top_k(top_k))
     }
 
-    /// Parallel rayon linear scan — O(N) with SIMD dot product.
+    /// Parallel rayon linear scan — O(N); the f16 dot product is safe code the compiler can vectorise.
     ///
     /// Suitable for ≤ ~10 K items or when HNSW is not yet built.
     pub fn linear_search(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
