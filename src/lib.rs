@@ -17,7 +17,7 @@ pub mod knowledge_store;
 
 pub use engine_error::EngineError;
 pub use hnsw_index::HnswIndex;
-pub use knowledge_store::{KnowledgeItem, KnowledgeStore, SearchQuery, SearchResult};
+pub use knowledge_store::{BuiltIndex, IndexJob, KnowledgeItem, KnowledgeStore, SearchQuery, SearchResult};
 pub use profile::Profile;
 pub use translator::{TranslationMatch, Translator};
 pub use validator::{MatchMode, ValidationMarker, ValidationResult, Validator};

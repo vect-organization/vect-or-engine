@@ -92,14 +92,18 @@ impl<'a> SearchQuery<'a> {
 
 /// The central in-memory knowledge base with pluggable search backends.
 pub struct KnowledgeStore {
-    /// Metadata for each item (id + arbitrary JSON fields).
-    pub items: Vec<SlimItem>,
+    /// Metadata for each item (id + arbitrary JSON fields). Private (D11): the vectors, the
+    /// dimension and the index must stay in step, so callers read through accessors.
+    items: Vec<SlimItem>,
     /// f16-quantised vectors — parallel to `items`.
     vectors_f16: Vec<Vec<f16>>,
     /// HNSW index (built on demand via `build_index`).
     hnsw: Option<HnswIndex>,
-    /// Expected vector dimensionality (set on first load).
-    pub dim: usize,
+    /// Expected vector dimensionality (set by every successful load).
+    dim: usize,
+    /// Bumped by every load. An index built off-lock (P1) is installed only if this is
+    /// still the value it was built from.
+    generation: u64,
 }
 
 impl Default for KnowledgeStore {
@@ -115,7 +119,18 @@ impl KnowledgeStore {
             vectors_f16: Vec::new(),
             hnsw: None,
             dim: 0,
+            generation: 0,
         }
+    }
+
+    /// Vector dimensionality of the loaded knowledge base (0 when nothing is loaded).
+    pub fn dim(&self) -> usize {
+        self.dim
+    }
+
+    /// Metadata of the loaded items, in load order.
+    pub fn items(&self) -> &[SlimItem] {
+        &self.items
     }
 
     pub fn len(&self) -> usize {
@@ -150,15 +165,20 @@ impl KnowledgeStore {
         let raw: Vec<KnowledgeItem> = serde_json::from_slice(&bytes)?;
         let count = raw.len();
 
+        // D12: an empty file is an error, not a silent no-op that leaves the old KB in place.
         if count == 0 {
-            return Ok(0);
+            return Err(EngineError::InvalidInput("the knowledge base file contains no items".into()));
         }
 
         let new_dim = raw[0].vector.len();
         if new_dim == 0 {
             return Err(EngineError::InvalidInput("the first item has an empty vector (dimension 0)".into()));
         }
-        for (i, item) in raw.iter().enumerate() {
+
+        // D1: build into locals; `self` is touched only after every item has passed.
+        let mut items = Vec::with_capacity(count);
+        let mut vectors_f16 = Vec::with_capacity(count);
+        for (i, item) in raw.into_iter().enumerate() {
             if item.vector.len() != new_dim {
                 return Err(EngineError::DimensionMismatch { expected: new_dim, got: item.vector.len() });
             }
@@ -167,33 +187,22 @@ impl KnowledgeStore {
                     "item #{i} has a vector component {x} that is not finite or exceeds {F16_MAX_ABS}"
                 )));
             }
+            vectors_f16.push(item.vector.iter().map(|&x| f16::from_f32(x)).collect::<Vec<f16>>());
+            items.push(SlimItem { id: item.id, metadata: item.metadata });
         }
 
-        // Reset state (only reached when every item passed the checks above).
-        self.dim = new_dim;
-        self.hnsw = None;
-        self.items = Vec::with_capacity(count);
-        self.vectors_f16 = Vec::with_capacity(count);
-
-        for item in raw {
-            // Dimension guard.
-            if item.vector.len() != self.dim {
-                return Err(EngineError::DimensionMismatch {
-                    expected: self.dim,
-                    got: item.vector.len(),
-                });
-            }
-            // Quantise f32 → f16.
-            let f16_vec: Vec<f16> = item.vector.iter().map(|&x| f16::from_f32(x)).collect();
-
-            self.vectors_f16.push(f16_vec);
-            self.items.push(SlimItem {
-                id: item.id,
-                metadata: item.metadata,
-            });
-        }
-
+        self.install(items, vectors_f16, new_dim);
         Ok(count)
+    }
+
+    /// Replace the whole knowledge base in one step: items, vectors, dimension, a dropped
+    /// index and a new generation. The only place the parallel vectors change.
+    fn install(&mut self, items: Vec<SlimItem>, vectors_f16: Vec<Vec<f16>>, dim: usize) {
+        self.items = items;
+        self.vectors_f16 = vectors_f16;
+        self.dim = dim;
+        self.hnsw = None;
+        self.generation += 1;
     }
 
     /// Rejects a query that contains NaN or an infinity (change-log D4).
@@ -210,14 +219,34 @@ impl KnowledgeStore {
     ///
     /// **CPU-intensive** — call this inside `tokio::task::spawn_blocking`.
     pub fn build_index(&mut self) {
-        // Dequantise for HNSW build (needed once; not kept afterwards).
-        let vecs_f32: Vec<Vec<f32>> = self
-            .vectors_f16
-            .iter()
-            .map(|v| v.iter().map(|&x| f32::from(x)).collect())
-            .collect();
+        // `&mut self` is held throughout, so the generation cannot change.
+        self.hnsw = Some(self.index_job().build().index);
+    }
 
-        self.hnsw = Some(HnswIndex::build(&vecs_f32));
+    /// P1: copy what an index build needs, so the build can run without holding the engine
+    /// lock. Pair with `install_index`.
+    pub fn index_job(&self) -> IndexJob {
+        IndexJob {
+            generation: self.generation,
+            vectors: self
+                .vectors_f16
+                .iter()
+                .map(|v| v.iter().map(|&x| f32::from(x)).collect())
+                .collect(),
+        }
+    }
+
+    /// Install an index built from `index_job`. Fails when the knowledge base was loaded
+    /// again in the meantime (the index would point at the wrong items).
+    pub fn install_index(&mut self, built: BuiltIndex) -> Result<usize, EngineError> {
+        if built.generation != self.generation {
+            return Err(EngineError::InvalidInput(
+                "the knowledge base was reloaded while the index was being built; build it again".into(),
+            ));
+        }
+        let n = self.items.len();
+        self.hnsw = Some(built.index);
+        Ok(n)
     }
 
     // ── Search ────────────────────────────────────────────────────────────────
@@ -332,34 +361,48 @@ impl KnowledgeStore {
             "SELECT id, metadata, vector_f16 FROM kb_items ORDER BY idx"
         ).map_err(|e| EngineError::Database(e.to_string()))?;
 
-        let rows: Vec<(Option<String>, String, Vec<u8>)> = stmt
+        // D2: parse every row into locals, fail on the first bad one, and touch `self` only at
+        // the end, so a bad cache neither skips rows silently nor keeps the previous dimension.
+        let mut rows = stmt
             .query_map([], |row| {
-                Ok((row.get(0)?, row.get(1)?, row.get(2)?))
+                Ok((row.get::<_, Option<String>>(0)?, row.get::<_, String>(1)?, row.get::<_, Vec<u8>>(2)?))
             })
-            .map_err(|e| EngineError::Database(e.to_string()))?
-            .filter_map(|r| r.ok())
-            .collect();
+            .map_err(|e| EngineError::Database(e.to_string()))?;
 
-        self.items.clear();
-        self.vectors_f16.clear();
-        self.hnsw = None;
-
-        for (id, meta_json, blob) in rows {
-            let metadata: serde_json::Map<String, serde_json::Value> =
-                serde_json::from_str(&meta_json)?;
-            let f16v: Vec<f16> = blob
-                .chunks_exact(2)
-                .map(|b| f16::from_le_bytes([b[0], b[1]]))
-                .collect();
-
-            if self.dim == 0 {
-                self.dim = f16v.len();
+        let mut items = Vec::new();
+        let mut vectors_f16: Vec<Vec<f16>> = Vec::new();
+        let mut dim = 0usize;
+        let mut n = 0usize;
+        for row in &mut rows {
+            let (id, meta_json, blob) = row.map_err(|e| EngineError::Database(format!("cache row #{n}: {e}")))?;
+            if blob.is_empty() || blob.len() % 2 != 0 {
+                return Err(EngineError::InvalidInput(format!(
+                    "cache row #{n} has a vector of {} bytes (not a whole number of f16 values)",
+                    blob.len()
+                )));
             }
-            self.items.push(SlimItem { id, metadata });
-            self.vectors_f16.push(f16v);
+            let metadata: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&meta_json)
+                .map_err(|e| EngineError::InvalidInput(format!("cache row #{n} has invalid metadata: {e}")))?;
+            let f16v: Vec<f16> = blob.chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]])).collect();
+            if n == 0 {
+                dim = f16v.len();
+            } else if f16v.len() != dim {
+                return Err(EngineError::DimensionMismatch { expected: dim, got: f16v.len() });
+            }
+            if f16v.iter().any(|x| !x.is_finite()) {
+                return Err(EngineError::InvalidInput(format!("cache row #{n} has a non-finite component")));
+            }
+            items.push(SlimItem { id, metadata });
+            vectors_f16.push(f16v);
+            n += 1;
+        }
+        drop(rows);
+        if n == 0 {
+            return Err(EngineError::InvalidInput("the cache contains no items".into()));
         }
 
-        Ok(self.items.len())
+        self.install(items, vectors_f16, dim);
+        Ok(n)
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -373,6 +416,27 @@ impl KnowledgeStore {
             metadata: item.metadata.clone(),
         }
     }
+}
+
+// ─── Off-lock index build (P1) ───────────────────────────────────────────────
+
+/// A snapshot of the vectors to index; owns its data, so it can move to another thread.
+pub struct IndexJob {
+    generation: u64,
+    vectors: Vec<Vec<f32>>,
+}
+
+impl IndexJob {
+    /// CPU-intensive; run it on a blocking thread, with no engine lock held.
+    pub fn build(self) -> BuiltIndex {
+        BuiltIndex { generation: self.generation, index: HnswIndex::build(&self.vectors) }
+    }
+}
+
+/// A finished index tagged with the generation it was built from.
+pub struct BuiltIndex {
+    generation: u64,
+    index: HnswIndex,
 }
 
 // ─── Result type ─────────────────────────────────────────────────────────────
@@ -453,7 +517,7 @@ mod tests {
         let mut store = KnowledgeStore::new();
         let p = write_kb(r#"[{"id":"a","vector":[]}]"#);
         assert!(store.load_from_path(&p).is_err());
-        assert_eq!(store.dim, 0);
+        assert_eq!(store.dim(), 0);
         std::fs::remove_file(p).ok();
     }
 
@@ -473,15 +537,97 @@ mod tests {
     }
 
     #[test]
-    fn a_rejected_load_keeps_the_previous_kb() {
+    fn d1_failed_load_keeps_previous_kb() {
         let mut store = KnowledgeStore::new();
         let ok = write_kb(r#"[{"id":"a","vector":[1.0,0.0]},{"id":"b","vector":[0.0,1.0]}]"#);
         assert_eq!(store.load_from_path(&ok).unwrap(), 2);
         let bad = write_kb(r#"[{"id":"c","vector":[1.0,0.0]},{"id":"d","vector":[1.0]}]"#);
         assert!(store.load_from_path(&bad).is_err());
         assert_eq!(store.len(), 2, "validation happens before the old KB is dropped");
+        assert_eq!(store.dim(), 2);
         std::fs::remove_file(ok).ok();
         std::fs::remove_file(bad).ok();
+    }
+
+    #[test]
+    fn d12_empty_file_is_an_error_and_keeps_the_previous_kb() {
+        let mut store = KnowledgeStore::new();
+        let ok = write_kb(r#"[{"id":"a","vector":[1.0,0.0]}]"#);
+        store.load_from_path(&ok).unwrap();
+        let empty = write_kb("[]");
+        let e = store.load_from_path(&empty).unwrap_err().to_string();
+        assert!(e.contains("no items"), "{e}");
+        assert_eq!(store.len(), 1);
+        std::fs::remove_file(ok).ok();
+        std::fs::remove_file(empty).ok();
+    }
+
+    fn cache_path(tag: &str) -> String {
+        std::env::temp_dir()
+            .join(format!("vect-cache-{tag}-{}.db", std::process::id()))
+            .to_string_lossy()
+            .into_owned()
+    }
+
+    #[test]
+    fn d2_cache_load_resets_dim() {
+        // A 4-dim KB is loaded first; a 2-dim cache must replace the dimension, not inherit it.
+        let mut store = make_store(3, 4);
+        let src = write_kb(r#"[{"id":"a","vector":[1.0,0.0]},{"id":"b","vector":[0.0,1.0]}]"#);
+        let mut two = KnowledgeStore::new();
+        two.load_from_path(&src).unwrap();
+        let db = cache_path("dim");
+        two.save_to_sqlite(&db).unwrap();
+        assert_eq!(store.load_from_sqlite(&db).unwrap(), 2);
+        assert_eq!(store.dim(), 2);
+        std::fs::remove_file(src).ok();
+        std::fs::remove_file(db).ok();
+    }
+
+    #[test]
+    fn d2_cache_with_a_bad_row_fails_and_keeps_the_previous_kb() {
+        let mut store = make_store(3, 4);
+        let db = cache_path("bad");
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch(
+                "CREATE TABLE kb_items (idx INTEGER PRIMARY KEY, id TEXT, metadata TEXT NOT NULL, vector_f16 BLOB NOT NULL);
+                 INSERT INTO kb_items VALUES (0, 'a', '{}', x'00380038');
+                 INSERT INTO kb_items VALUES (1, 'b', '{}', x'003800');
+                 INSERT INTO kb_items VALUES (2, 'c', '{}', x'0038');",
+            )
+            .unwrap();
+        }
+        let e = store.load_from_sqlite(&db).unwrap_err().to_string();
+        assert!(e.contains("row #1"), "{e}");
+        assert_eq!(store.len(), 3, "the previous KB is kept");
+        assert_eq!(store.dim(), 4);
+        // A dimension change between rows is an error too.
+        {
+            let conn = rusqlite::Connection::open(&db).unwrap();
+            conn.execute_batch("UPDATE kb_items SET vector_f16 = x'00380038' WHERE idx = 1;").unwrap();
+        }
+        assert!(store.load_from_sqlite(&db).is_err());
+        assert_eq!(store.len(), 3);
+        std::fs::remove_file(db).ok();
+    }
+
+    #[test]
+    fn p1_index_built_off_lock_is_rejected_when_the_kb_was_reloaded() {
+        let mut store = make_store(20, 4);
+        let job = store.index_job();
+        let built = job.build(); // runs with no access to the store
+        assert_eq!(store.install_index(built).unwrap(), 20);
+        assert!(store.has_index());
+
+        let job = store.index_job();
+        let built = job.build();
+        let other = write_kb(r#"[{"id":"x","vector":[1.0,0.0,0.0,0.0]}]"#);
+        store.load_from_path(&other).unwrap(); // generation moves on, old index dropped
+        assert!(!store.has_index());
+        assert!(store.install_index(built).is_err(), "a stale index must not be installed");
+        assert!(!store.has_index());
+        std::fs::remove_file(other).ok();
     }
 
     #[test]

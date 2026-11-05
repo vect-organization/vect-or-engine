@@ -61,7 +61,7 @@ async fn main() {
     let (tx, mut rx) = mpsc::unbounded_channel::<String>();
 
     // Stdout serialiser task
-    tokio::spawn(async move {
+    let writer_task = tokio::spawn(async move {
         let mut writer = BufWriter::new(tokio::io::stdout());
         while let Some(line) = rx.recv().await {
             let _ = writer.write_all(line.as_bytes()).await;
@@ -72,21 +72,23 @@ async fn main() {
 
     // Stdin reader
     let mut lines = BufReader::new(tokio::io::stdin()).lines();
+    // D10: one request at a time, in arrival order. A `load_knowledge_base` followed by a
+    // `build_index` and a `search` on the next lines must run in that order; the old
+    // one-task-per-line loop could run them out of order.
     while let Ok(Some(line)) = lines.next_line().await {
-        let trimmed = line.trim().to_owned();
+        let trimmed = line.trim();
         if trimmed.is_empty() { continue; }
-        let state_c = state.clone();
-        let tx_c = tx.clone();
-        tokio::spawn(async move {
-            let resp = match serde_json::from_str::<RpcRequest>(&trimmed) {
-                Ok(req) => handle_request(req, &state_c).await,
-                Err(e)  => RpcResponse::err(format!("Parse error: {e}"), None),
-            };
-            if let Ok(json) = serde_json::to_string(&resp) {
-                let _ = tx_c.send(json);
-            }
-        });
+        let resp = match serde_json::from_str::<RpcRequest>(trimmed) {
+            Ok(req) => handle_request(req, &state).await,
+            Err(e)  => RpcResponse::err(format!("Parse error: {e}"), None),
+        };
+        if let Ok(json) = serde_json::to_string(&resp) {
+            let _ = tx.send(json);
+        }
     }
+    // D10: at EOF close the channel and wait for the writer, so no reply is lost.
+    drop(tx);
+    let _ = writer_task.await;
 }
 
 async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResponse {
@@ -218,14 +220,27 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
                 .and_then(|p| p.get("vector")).and_then(|v| v.as_array()) else {
                 return RpcResponse::err("Missing or invalid 'vector' parameter", req.id);
             };
-            let query: Vec<f32> = vec_arr.iter()
-                .filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            // D9: every entry must be a number; dropping the others would give a shorter query
+            // and a truncated dot product.
+            let mut query: Vec<f32> = Vec::with_capacity(vec_arr.len());
+            for (i, v) in vec_arr.iter().enumerate() {
+                match v.as_f64() {
+                    Some(f) => query.push(f as f32),
+                    None => return RpcResponse::err(format!("'vector' entry #{i} is not a number"), req.id),
+                }
+            }
             if let Err(e) = KnowledgeStore::check_finite_query(&query) {
                 return RpcResponse::from_engine_err(e, req.id);
             }
             let s = state.read().await;
             if s.knowledge_store.is_empty() {
                 return RpcResponse::err("Knowledge base empty. Call load_knowledge_base first.", req.id);
+            }
+            if query.len() != s.knowledge_store.dim() {
+                return RpcResponse::from_engine_err(
+                    EngineError::DimensionMismatch { expected: s.knowledge_store.dim(), got: query.len() },
+                    req.id,
+                );
             }
             let results = s.knowledge_store.search(&query, top_k);
             let json_results: Vec<Value> = results.iter().map(|r| r.to_json_value()).collect();
@@ -237,7 +252,7 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
             let s = state.read().await;
             RpcResponse::ok(serde_json::json!({
                 "count": s.knowledge_store.len(),
-                "dim":   s.knowledge_store.dim,
+                "dim":   s.knowledge_store.dim(),
                 "hnsw_ready": s.knowledge_store.has_index(),
             }), req.id)
         }

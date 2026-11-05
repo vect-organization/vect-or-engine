@@ -28,6 +28,19 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ---
 
+## [0.3.9] - 2026-11-06
+
+Phase B of the 0.4.0 work (load safety). Change-log rows: `docs/changes/v0.4.0.csv` (D1, D2, D9, D10, D11, D12, P1).
+
+### Changed
+- `buildIndex` no longer holds the engine lock while it builds (P1): it copies the vectors under a read lock, builds with no lock, and installs the index under a short write lock. `validateSync` and `search` keep answering during a build (3,000 vectors: slowest `validateSync` 2.3 ms during an 8.3 s build). If the knowledge base is loaded again while an index is being built, the stale index is not installed and `buildIndex` fails with an error that says so
+- A failed load keeps the previous knowledge base (D1), and a cache load (`loadKbCache`) is parsed into locals first (D2): the dimension is reset from the cache, a vector of odd byte length, a dimension change between rows, a non-finite component or bad metadata fails the whole load instead of skipping the row, and an empty cache is an error
+- **Behaviour change (D12)**: loading an empty knowledge-base file is an error (`the knowledge base file contains no items`); it used to return 0 and leave the previous knowledge base in place
+- CLI: `search` rejects a query whose length differs from the knowledge base and any non-numeric entry (D9); requests are handled in the order sent, and every reply is written before the process exits at EOF (D10)
+- Rust API (D11): `KnowledgeStore::items` and `KnowledgeStore::dim` are private; use `items()` and `dim()`. New `index_job()`, `install_index()`, `IndexJob` and `BuiltIndex` for building off-lock
+
+---
+
 ## [0.3.8] - 2026-11-06
 
 Phase A of the 0.4.0 work (guard rails). Change-log rows: `docs/changes/v0.4.0.csv`.
