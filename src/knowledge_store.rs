@@ -507,7 +507,11 @@ mod tests {
     }
 
     fn write_kb(json: &str) -> String {
-        let path = std::env::temp_dir().join(format!("vect-ks-{}-{}.json", std::process::id(), json.len()));
+        // A counter, not the JSON length: tests run in parallel, and two tests that write the
+        // same content (so the same length) used to share one file and delete it under each other.
+        static NEXT: std::sync::atomic::AtomicUsize = std::sync::atomic::AtomicUsize::new(0);
+        let n = NEXT.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
+        let path = std::env::temp_dir().join(format!("vect-ks-{}-{n}.json", std::process::id()));
         std::fs::write(&path, json).unwrap();
         path.to_string_lossy().into_owned()
     }
