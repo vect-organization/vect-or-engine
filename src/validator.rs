@@ -5,7 +5,7 @@
 #![forbid(unsafe_code)]
 
 use crate::profile::Profile;
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, MatchKind};
 use crate::limits::MAX_REGEX_SIZE;
 use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
 use std::collections::HashMap;
@@ -261,7 +261,7 @@ impl Validator {
         }
 
         let conflict_items_ac = if !patterns.is_empty() {
-            AhoCorasick::builder().build(&patterns).ok()
+            AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&patterns).ok()
         } else {
             None
         };
@@ -565,6 +565,25 @@ mod tests {
             }
         }
         assert_eq!(compared, 3 * texts.len());
+    }
+
+    #[test]
+    fn d5_longest_code_reported() {
+        // F20 and F20.0 both start at the same position; the longer code must win.
+        // (Before D5 the Standard match kind reported the earlier-listed F20 and hid F20.0.)
+        let json = r#"{"assessment_rules":{"document_template":{"numerical_requirements":{
+            "conflict_items":[
+                {"item_code":"F20","name":"Schizophrenia","reason":"broad"},
+                {"item_code":"F20.0","name":"Paranoid schizophrenia","reason":"specific"}
+            ]}}}}"#;
+        let v = Validator::new(&Profile::load_from_json_str(json).unwrap()).unwrap();
+        let res = v.validate("diagnosis F20.0 recorded");
+        assert_eq!(res.markers.len(), 1, "{:?}", res.markers);
+        assert!(res.markers[0].message.contains("specific"), "{:?}", res.markers);
+        // The shorter code still reports on its own.
+        let res = v.validate("diagnosis F20 recorded");
+        assert_eq!(res.markers.len(), 1);
+        assert!(res.markers[0].message.contains("broad"));
     }
 
     #[test]
