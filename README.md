@@ -1,7 +1,7 @@
 # VectOrEngine: The Rust Engine Behind VectOrEdit's Linter and Knowledge Search
 
 [![License: MIT](https://img.shields.io/badge/License-MIT-blue.svg?style=flat-square)](LICENSE)
-[![Version](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1abcdefggs%2Fvect-or-engine%2Fmain%2F.github%2Fbadges%2Fversion.json&style=flat-square)](package.json)
+[![Version](https://img.shields.io/github/package-json/v/1abcdefggs/vect-or-engine?label=version&color=4f46e5&style=flat-square)](package.json)
 
 [![Security: reviewed 2026-11-05](https://img.shields.io/badge/security-reviewed%202026--11--05-green?style=flat-square)](#security-facts-checked-on-2026-11-05)[![Rust CI](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml)
 [![CodeQL](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/dynamic/github-code-scanning/codeql/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/security/code-scanning)
@@ -249,7 +249,7 @@ Errors follow JSON-RPC 2.0: -32700 parse error, -32600 invalid request, -32601 u
 
 ### Requirements: Rust and Node.js 24
 
-[![Rust](https://img.shields.io/endpoint?url=https%3A%2F%2Fraw.githubusercontent.com%2F1abcdefggs%2Fvect-or-engine%2Fmain%2F.github%2Fbadges%2Frust.json&style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/)
+[![Rust](https://img.shields.io/badge/Rust-2021_Edition-DEA584?style=flat-square&logo=rust&logoColor=black)](https://www.rust-lang.org/)
 [![N-API](https://img.shields.io/badge/N--API-Native_Addon-green?style=flat-square&logo=cplusplus&logoColor=white)](https://napi.rs/)
 
 - [Rust](https://www.rust-lang.org/) (2021 edition, `cargo` v1.75+)
