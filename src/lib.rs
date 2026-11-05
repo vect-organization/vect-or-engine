@@ -7,17 +7,11 @@
 
 #![deny(clippy::all)]
 
-#[path = "src/engine_error.rs"]
 pub mod engine_error;
-#[path = "src/profile.rs"]
 pub mod profile;
-#[path = "src/validator.rs"]
 pub mod validator;
-#[path = "src/translator.rs"]
 pub mod translator;
-#[path = "src/hnsw_index.rs"]
 pub mod hnsw_index;
-#[path = "src/knowledge_store.rs"]
 pub mod knowledge_store;
 
 pub use engine_error::EngineError;
@@ -28,5 +22,4 @@ pub use translator::{TranslationMatch, Translator};
 pub use validator::{MatchMode, ValidationMarker, ValidationResult, Validator};
 
 #[cfg(feature = "napi")]
-#[path = "src/napi_bindings.rs"]
 mod napi_bindings;
