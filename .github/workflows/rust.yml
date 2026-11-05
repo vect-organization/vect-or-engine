@@ -32,5 +32,16 @@ jobs:
         node-version: 24
     - name: Run build-check tests
       run: node --test test/test-engine-build-check.mjs
+    - name: Check a panic becomes a JS error
+      run: node --test test/test-panic-to-js-error.mjs
     - name: Check the change log
       run: node --test test/test-check-change-log.mjs
+
+  deny:
+    # Change-log S8: advisories, licences, bans and sources on every pull request.
+    runs-on: ubuntu-latest
+    steps:
+    - uses: actions/checkout@v4
+    - uses: EmbarkStudios/cargo-deny-action@v2
+      with:
+        command: check

@@ -604,6 +604,44 @@ mod tests {
         path.to_string_lossy().into_owned()
     }
 
+    /// Change-log S8: a fixed-seed randomized property test (no extra crate). For many random
+    /// stores and queries, `linear_search` equals a naive reference: the best `top_k` rows by
+    /// score descending, ties by index ascending, never more than `top_k` of them.
+    #[test]
+    fn s8_linear_search_matches_naive_reference() {
+        let mut state: u64 = 0x9E37_79B9_7F4A_7C15; // fixed seed, xorshift64
+        let mut next = move || {
+            state ^= state << 13;
+            state ^= state >> 7;
+            state ^= state << 17;
+            state
+        };
+        for _ in 0..200 {
+            let n = (next() % 40) as usize + 1;
+            let dim = (next() % 20) as usize + 1;
+            // Small integers, so equal scores (ties) actually occur.
+            let mut data = Vec::with_capacity(n * dim);
+            for _ in 0..n * dim {
+                data.push((next() % 5) as f32 - 2.0);
+            }
+            let query: Vec<f32> = (0..dim).map(|_| (next() % 5) as f32 - 2.0).collect();
+            let top_k = (next() % 50) as usize;
+
+            let items = (0..n).map(|i| SlimItem { id: Some(format!("i{i}")), metadata: serde_json::Map::new() }).collect();
+            let mut store = KnowledgeStore::new();
+            store.install(items, VectorMatrix::from_flat(dim, data.clone()).unwrap());
+
+            let mut expected: Vec<(f32, usize)> =
+                (0..n).map(|i| (dot(&query, &data[i * dim..(i + 1) * dim]), i)).collect();
+            expected.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
+            expected.truncate(top_k);
+
+            let got: Vec<(f32, usize)> = store.linear_search(&query, top_k).iter().map(|r| (r.score, r.idx)).collect();
+            assert!(got.len() <= top_k);
+            assert_eq!(got, expected, "n={n} dim={dim} top_k={top_k}");
+        }
+    }
+
     #[test]
     fn d8_zero_dim_rejected() {
         let mut store = KnowledgeStore::new();
