@@ -40,7 +40,6 @@ fn main() {
     // so the build time and dirty flag stay current.
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
-    println!("cargo:rerun-if-changed=lib.rs");
     println!("cargo:rerun-if-changed=src");
     println!("cargo:rerun-if-changed=.git/HEAD");
     println!("cargo:rerun-if-changed=.git/index");

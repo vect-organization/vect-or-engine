@@ -315,7 +315,6 @@ vect-or-engine/
 ├── Cargo.toml          # Rust crate configuration, `napi` feature & optimization profiles
 ├── Cargo.lock          # Deterministic Rust dependency lockfile
 ├── build.rs            # Embeds git hash, dirty flag and build time for buildInfo()
-├── lib.rs              # Crate root: core engine modules & public re-exports (no N-API)
 ├── index.js            # Cross-platform native addon loader
 ├── index.d.ts          # TypeScript type declarations
 ├── package.json        # npm package configuration & NAPI metadata (@1abcdefggs/vect-or-engine)
@@ -335,6 +334,7 @@ vect-or-engine/
 │   ├── test-engine-build-check.mjs # Build-check verdicts on the git history
 │   └── test-kb.json    # Minimal test dataset
 └── src/
+    ├── lib.rs          # Crate root: core engine modules & public re-exports (no N-API)
     ├── napi_bindings.rs # N-API bindings & Node.js native interface (only with --features napi)
     ├── main.rs         # Headless CLI binary (vect_or_engine_cli), core engine only
     ├── hnsw_index.rs   # HNSW graph indexing & search implementation

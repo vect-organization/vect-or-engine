@@ -20,7 +20,7 @@ import { fileURLToPath } from 'node:url';
 import { createRequire } from 'node:module';
 
 // Paths whose change makes a compiled binary differ from the source.
-export const ENGINE_INPUTS = ['src', 'lib.rs', 'Cargo.toml', 'build.rs'];
+export const ENGINE_INPUTS = ['src', 'Cargo.toml', 'build.rs'];
 
 function git(repoRoot, args) {
   try {

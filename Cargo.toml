@@ -11,7 +11,7 @@ readme = "README.md"
 
 [lib]
 name = "vect_or_engine"
-path = "lib.rs"
+path = "src/lib.rs"
 crate-type = ["cdylib", "rlib"]
 
 [[bin]]
