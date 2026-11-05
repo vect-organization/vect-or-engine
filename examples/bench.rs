@@ -210,7 +210,7 @@ fn document(chars: usize, rng: &mut Rng) -> String {
     let mut s = String::with_capacity(chars + 16);
     while s.len() < chars {
         s.push_str(WORDS[(rng.next_u64() % WORDS.len() as u64) as usize]);
-        s.push(if rng.next_u64() % 12 == 0 { '\n' } else { ' ' });
+        s.push(if rng.next_u64().is_multiple_of(12) { '\n' } else { ' ' });
     }
     s.truncate(chars);
     s
