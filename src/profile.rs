@@ -83,7 +83,7 @@ impl Profile {
     /// guideline files deserialize into an all-None Profile with no error and no rule fires.
     pub fn load_any_json_str(json_str: &str) -> Result<Self, serde_json::Error> {
         let value: serde_json::Value = serde_json::from_str(json_str)?;
-        let is_guideline = value.get("rules").map_or(false, |r| r.is_array())
+        let is_guideline = value.get("rules").is_some_and(|r| r.is_array())
             && value.get("domain").is_some();
         if is_guideline {
             if let Ok(p) = Self::from_guideline_json_str(json_str) {
@@ -99,7 +99,7 @@ impl Profile {
             .assessment_rules
             .as_ref()
             .and_then(|a| a.keyword_rules.as_ref())
-            .map_or(true, |k| k.is_empty());
+            .is_none_or(|k| k.is_empty());
         // Destructuring (not field access) so that adding a field to DocumentTemplate
         // fails to compile here until is_empty is updated.
         let no_num = match self.assessment_rules.as_ref().and_then(|a| a.document_template.as_ref()) {
@@ -109,7 +109,7 @@ impl Profile {
         let no_conv = self
             .conversational_translation_rules
             .as_ref()
-            .map_or(true, |c| c.rules.is_empty());
+            .is_none_or(|c| c.rules.is_empty());
         no_kw && no_num && no_conv
     }
 
