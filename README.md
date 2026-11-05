@@ -33,7 +33,7 @@
 - **Schema-Driven Real-Time Linter**: Document validation and clinical/editorial conflict detection powered by `aho-corasick` and regular expressions (`loadProfile`, `validateSync`, `validate`).
 - **Memory-Efficient Representation**:
   - `f16` half-precision float vector quantization (50% RAM reduction).
-  - `memmap2` zero-copy memory-mapped I/O for instant multi-gigabyte knowledge loading.
+  - `memmap2` memory-mapped I/O, so a knowledge file is read without copying it into a buffer first.
 - **Native Node.js / Electron Bindings (N-API)**: Direct in-memory bindings via `napi-rs` with non-blocking worker pool execution (`spawn_blocking`).
 - **Model Context Protocol (MCP) Server (Experimental)**: HTTP JSON-RPC daemon code (`mcp/server.mjs`) is provided as an experimental reference implementation; formal integration testing has not yet been conducted.
 - **Standalone CLI Binary**: Headless `vect_or_engine_cli` for terminal-based and non-Node.js pipeline integrations.
@@ -57,6 +57,8 @@ The current default uses heuristic neighbour selection, with M = 16 and M0 = 32 
 Uniform vectors point in random directions, so they are the hardest case for graph search. Recall stays
 at about 0.48 at 10,000 vectors. Dimension 768 was also measured: uniform 0.385, clustered 0.999.
 
+A check on the project's own sentence embeddings (multilingual-e5-small, 384 dimensions; 7 dictionaries, 3,840 vectors in one index; every stored vector as a query) gave recall@10 0.998 with the current default (2026-11-05). This data behaves like the clustered case, not the uniform one. That script is not in this repository yet.
+
 Query speed is not stated here, because it varies between runs on the same machine.
 The full procedure, reports and reproduction script are in [verification/recall](verification/recall/README.md).
 
@@ -66,6 +68,7 @@ The full procedure, reports and reproduction script are in [verification/recall]
 vect-or-engine/
 ├── Cargo.toml          # Rust crate configuration, `napi` feature & optimization profiles
 ├── Cargo.lock          # Deterministic Rust dependency lockfile
+├── build.rs            # Embeds git hash, dirty flag and build time for buildInfo()
 ├── lib.rs              # Crate root: core engine modules & public re-exports (no N-API)
 ├── index.js            # Cross-platform native addon loader
 ├── index.d.ts          # TypeScript type declarations
@@ -74,8 +77,16 @@ vect-or-engine/
 ├── README.md           # Documentation
 ├── mcp/
 │   └── server.mjs      # Model Context Protocol (MCP) JSON-RPC HTTP server
+├── scripts/
+│   └── engine-build-check.mjs # Checks that a built .node matches HEAD (npm run check:engine)
+├── examples/
+│   └── bench.rs        # HNSW recall and latency benchmark
+├── verification/
+│   └── recall/         # Recall procedure, reports and reproduction scripts
 ├── test/
 │   ├── test-napi.js    # Node.js N-API integration tests
+│   ├── test-match-modes.js # Match modes literal / regex / both (needs a built .node)
+│   ├── test-engine-build-check.mjs # Build-check verdicts on the git history
 │   └── test-kb.json    # Minimal test dataset
 └── src/
     ├── napi_bindings.rs # N-API bindings & Node.js native interface (only with --features napi)
@@ -149,7 +160,18 @@ cargo test --features napi
 
 # Run Node.js N-API binding integration tests
 npm test
+
+# Match modes (literal / regex / both) against the built addon
+node test/test-match-modes.js
+
+# Build-check verdicts (needs the full git history)
+node --test test/test-engine-build-check.mjs
+
+# Check that the built .node matches HEAD (exit 1 when stale or unknown)
+npm run check:engine
 ```
+
+`buildInfo()` returns `{ version, gitHash, gitDirty, builtAtUnix }`, fixed at build time. The version number alone cannot tell two builds apart; compare `gitHash` with HEAD (`npm run check:engine` does this).
 
 ### Start MCP Server (Port 4000) [Experimental / Unverified]
 
@@ -159,12 +181,12 @@ npm test
 npm run start-mcp
 ```
 
-Every request passes a gate before it runs (unreleased, planned for 0.4.0):
+Every request passes a gate before it runs (on `main` since PR #25; not yet in a published release, planned for 0.4.0):
 
 | Check | Default | Setting |
 | :--- | :--- | :--- |
 | `Host` and `Origin` headers must be `127.0.0.1` or `localhost` (blocks DNS rebinding and cross-site requests) | On; HTTP 403 otherwise | None |
-| `Authorization: Bearer <token>` | Off | Set `MCP_AUTH_TOKEN`; HTTP 401 without the right token |
+| `Authorization: Bearer <token>` | Off; the server logs a warning at startup | Set `MCP_AUTH_TOKEN`; HTTP 401 without the right token |
 | `load` paths must resolve (links included) under an allowed folder | On; the folder is this repository | Set `KB_ALLOWED_ROOT`; the server stops at startup if it does not exist |
 
 Errors follow JSON-RPC 2.0: -32700 parse error, -32600 invalid request, -32601 unknown method, -32602 invalid params (with the reason), -32603 internal error (details only in the server log).
@@ -176,6 +198,13 @@ Errors follow JSON-RPC 2.0: -32700 parse error, -32600 invalid request, -32601 u
 [![npm](https://img.shields.io/badge/npm-%401abcdefggs%2Fvect--or--engine-CB3837?style=flat-square&logo=npm)](https://github.com/1abcdefggs/vect-or-engine/packages)
 
 To integrate VectOrEngine into your desktop editor (e.g., `vect-or-edit`):
+
+The package is published to GitHub Packages (latest published: 0.3.6). npm needs the scope's registry and a token with `read:packages`, for example in `.npmrc`:
+
+```ini
+@1abcdefggs:registry=https://npm.pkg.github.com
+//npm.pkg.github.com/:_authToken=${NODE_AUTH_TOKEN}
+```
 
 ```bash
 # Via npm / GitHub Packages
@@ -195,6 +224,7 @@ A full example flow. **VectOrEdit** calls `loadProfile`, `validateSync`, `loadKn
 
 ```typescript
 import {
+  buildInfo,
   loadProfile,
   validateSync,
   loadKnowledgeBase,
@@ -205,11 +235,15 @@ import {
   kbInfo
 } from '@1abcdefggs/vect-or-engine';
 
+// ── 0. Which build is loaded ──
+console.log(buildInfo()); // { version, gitHash, gitDirty, builtAtUnix }
+
 // ── 1. Document Linting & Clinical Rule Validation ──
 // Load rule schema (e.g. conflict keywords, numeric thresholds)
-await loadProfile('./guidelines/medical_rules.json');
+// matchMode: 'literal' (default), 'regex' or 'both'. Call again with the same profile to change it; the KB is kept
+await loadProfile('./guidelines/medical_rules.json', 'literal');
 
-// Validate editor text in real time (< 1ms via Aho-Corasick)
+// Validate editor text (Aho-Corasick for literal rules)
 const lintResult = validateSync("Target document text from Monaco Editor...");
 if (!lintResult.isValid) {
   console.warn("Linter Markers:", lintResult.markers);
@@ -244,20 +278,16 @@ console.log("Vector Recommendations:", results);
 
 [![Rust CI](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/rust.yml)
 [![CodeQL](https://github.com/1abcdefggs/vect-or-engine/actions/workflows/dynamic/github-code-scanning/codeql/badge.svg)](https://github.com/1abcdefggs/vect-or-engine/security/code-scanning)
-[![Security: audit 2026-09-14, see notes](https://img.shields.io/badge/security-audit%202026--09--14%2C%20see%20notes-yellow?style=flat-square)](#security--audit)
+[![Security: reviewed 2026-11-05](https://img.shields.io/badge/security-reviewed%202026--11--05-green?style=flat-square)](#security--audit)
 
-A static and dynamic security audit on 2026-09-14 rated VectOrEngine **A+**. Its findings:
-- **Zero Supply-Chain Vulnerabilities**: Zero runtime npm package dependencies. `npm audit` returned 0 vulnerabilities.
-- **SQL Injection Immune**: SQLite caching (`knowledge_store.rs`) strictly employs parameterized prepared statements (`rusqlite::params!`).
-- **Loopback Isolation**: The MCP daemon (`server.mjs`) binds exclusively to `127.0.0.1`, completely blocking external network access.
-- **Rust Memory Safety**: Compile-time lifetime and bounds enforcement eliminates buffer overflows and memory corruption risks.
+Checked on `main` on 2026-11-05:
+- **Dependencies**: no runtime npm dependencies; `npm audit` reports 0 vulnerabilities. GitHub Dependabot, code scanning (CodeQL) and secret scanning have 0 open alerts
+- **SQL**: the SQLite cache (`knowledge_store.rs`) uses prepared statements with bound parameters (`rusqlite::params!`); no SQL is built from strings
+- **`unsafe` code**: 5 blocks. 2 in `hnsw_index.rs` (`get_unchecked` in the 4-way unrolled dot product and its tail) and 3 in `knowledge_store.rs` (one mmap, two `get_unchecked` loops). Memory safety outside these blocks is checked at compile time
+- **MCP server** (experimental, runs only when started with `npm run start-mcp`): listens on `127.0.0.1` only. Every request must have a `Host` / `Origin` of `127.0.0.1` or `localhost` (against DNS rebinding and cross-site requests), and `load` is limited to `KB_ALLOWED_ROOT`. The bearer token (`MCP_AUTH_TOKEN`) is opt-in, and the server warns at startup when it is not set. This gate is on `main` but not yet in a published release (planned for 0.4.0); 0.3.6 and earlier have no gate
+- **Error details**: since 0.3.6 the MCP server does not return raw error details to the client (CodeQL alert #1); internal errors answer `Internal error` and are logged on the server
 
-Later review found points the audit did not cover; the audit report is to be amended:
-- The source has 5 `unsafe` blocks: 2 in `hnsw_index.rs` (`get_unchecked` in the 4-way unrolled dot product and its tail) and 3 in `knowledge_store.rs` (one mmap, two `get_unchecked` loops). Memory safety outside these blocks is checked at compile time
-- The MCP server has no request gate up to 0.3.6. From 0.4.0 (planned) it checks `Host` / `Origin` (against DNS rebinding and cross-site requests) and limits `load` to `KB_ALLOWED_ROOT`; the bearer token is opt-in (`MCP_AUTH_TOKEN`). It is experimental and runs only when started with `npm run start-mcp`
-- Since 0.3.6 the MCP server no longer returns raw error details to the client (CodeQL alert #1); internal errors answer `Internal error` and are logged on the server
-
-📄 *The audit report (`SECURITY_AUDIT_REPORT_20260914.md`) is kept in the internal workspace and is not published in this repository.*
+An earlier audit (2026-09-14) is kept as an internal record and is not published here. It did not cover the `unsafe` blocks or the missing MCP gate, so its rating is not quoted.
 
 ---
 

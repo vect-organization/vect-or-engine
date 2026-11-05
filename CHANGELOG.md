@@ -13,12 +13,35 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ### Security
 - MCP server ran any request without a gate (Copilot code-scanning AI finding on PR #17, "Excessive agency risk"). Added before dispatch: `Host` / `Origin` must be `127.0.0.1` or `localhost` (HTTP 403), an opt-in bearer token via `MCP_AUTH_TOKEN` (HTTP 401), and `load` paths must resolve, links included, under `KB_ALLOWED_ROOT` (default: the repository; checked as written before any file access, then after resolving links). **Behaviour change**: `load` outside the repository now needs `KB_ALLOWED_ROOT`
+- The server logs a warning at startup when `MCP_AUTH_TOKEN` is not set; the token stays opt-in (owner decision 2026-11-04)
+
+### Added
+- `npm run check:engine` (`scripts/engine-build-check.mjs`): compares `buildInfo().gitHash` of the built `.node` with HEAD and reports ok, warn, stale-source, stale or unknown; exit 1 for stale and unknown. The publish workflow runs it after the build (PR #25)
+- Tests: `test/test-engine-build-check.mjs` (7 verdict cases on the git history) and `test/test-match-modes.js`; the `Rust` CI workflow checks out the full history and runs the build-check tests on Node.js 24 (PR #26)
+
+### Changed
+- `engines.node` is `>= 24` (was `>= 18`, end of life); README Node.js requirement updated
+
+### Documentation
+- README: security section lists the facts checked on 2026-11-05 instead of the 2026-09-14 rating; project structure, test commands, `buildInfo` and `matchMode` usage, GitHub Packages `.npmrc`, and a real-data recall check added
+
 ---
 
 ## [0.3.7] - 2026-11-04
 
+Not tagged or released. `main` carries this version number together with the Unreleased items above; the next release is planned as 0.4.0.
+
+### Changed
+- **HNSW default** (PR #21): neighbour selection uses the diversity heuristic and fills the remaining slots with pruned candidates; layer 0 keeps up to M0 = 2 x M = 32 links. M = 16, efConstruction = 200 and efSearch = 64 are unchanged. Search results change for every caller of the default. Recall@10 on synthetic 384-dimension data, 1,000 queries: uniform 1,000 vectors 0.8374 to 0.9751, clustered 1,000 0.6227 to 0.9998, uniform 10,000 0.2629 to 0.4786, clustered 10,000 0.6558 to 0.9990 (`verification/recall`)
+- `HnswParams` exposes the knobs for experiments (`build_with`, `search_with`); `examples/bench.rs` takes `--dim`, `--m`, `--m0`, `--ef-construction`, `--ef-search`, `--no-heuristic`, `--no-keep-pruned`
+
 ### Added
 - `buildInfo()` returns `{ version, gitHash, gitDirty, builtAtUnix }` so a `.node` file can be traced to the build that produced it. `build.rs` embeds the short git hash (`unknown` without git), whether the working tree had uncommitted changes (`"true"` / `"false"` / `"unknown"`), and the build time in UNIX seconds. The build reruns when sources, `Cargo.toml` or git HEAD change
+- `verification/recall/`: procedure, reports, `reproduce.ps1` and `make_recall_report.ps1` for the recall numbers (PR #21, #24)
+- `.github/workflows/badge-meta.yml`: writes the version and Rust badge JSON files when `Cargo.toml` changes on `main` (PR #23; not exercised yet)
+
+### Documentation
+- README: search parameters and speed claims corrected, recall section added (PR #22); badges placed in the sections they describe, CodeQL badge (PR #23); recall chart and method flow (PR #24)
 
 ---
 
