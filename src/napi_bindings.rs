@@ -225,20 +225,25 @@ pub async fn save_kb_cache(path: String) -> Result<()> {
 
 #[napi]
 pub async fn build_index() -> Result<u32> {
-    // Clone Arc to move it into the blocking task for CPU-intensive work.
-    let engine_arc = ENGINE.clone();
-    tokio::task::spawn_blocking(move || {
-        // Re-lock inside the new thread.
-        let mut engine = engine_arc.blocking_write();
+    // P1: hold the lock only to copy the vectors and, later, to install the result. The
+    // build itself (seconds on a large KB) runs with no lock, so `validateSync` and
+    // `search` keep answering meanwhile.
+    let job = {
+        let engine = ENGINE.read().await;
         if engine.knowledge_store.is_empty() {
-            return Err("Knowledge base is empty.".to_string());
+            return Err(Error::new(Status::GenericFailure, "Knowledge base is empty."));
         }
-        engine.knowledge_store.build_index();
-        Ok(engine.knowledge_store.len() as u32)
-    })
-    .await
-    .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))? // Handle task join error
-    .map_err(|e| Error::new(Status::GenericFailure, e)) // Handle our custom error
+        engine.knowledge_store.index_job()
+    };
+    let built = tokio::task::spawn_blocking(move || job.build())
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+    let mut engine = ENGINE.write().await;
+    let count = engine
+        .knowledge_store
+        .install_index(built)
+        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+    Ok(count as u32)
 }
 
 /// ADR-0005 Phase4.3: reject a query from a different vector space instead of letting
@@ -264,7 +269,7 @@ fn ensure_finite_query(query: &[f32]) -> Result<()> {
 pub async fn search(query: Float32Array, top_k: u32) -> Result<Vec<JsSearchResult>> {
     let engine = ENGINE.read().await;
     // The caller (vect-or-edit) falls back to Module 0 (P.scan dictionary matching) on this error.
-    ensure_query_dim(engine.knowledge_store.dim, query.len())?;
+    ensure_query_dim(engine.knowledge_store.dim(), query.len())?;
     ensure_finite_query(&query)?;
     // Pass query by reference to avoid allocation.
     let results = engine.knowledge_store.search(&query, top_k as usize);
@@ -276,7 +281,7 @@ pub async fn kb_info() -> Result<JsKbInfo> {
     let engine = ENGINE.read().await;
     Ok(JsKbInfo {
         count: engine.knowledge_store.len() as u32,
-        dim: engine.knowledge_store.dim as u32,
+        dim: engine.knowledge_store.dim() as u32,
         hnsw_ready: engine.knowledge_store.has_index(),
     })
 }
@@ -302,7 +307,6 @@ fn verify_safe_path(path_str: &str) -> Result<()> {
 #[cfg(test)]
 mod tests {
     use super::*;
-    use crate::knowledge_store::SlimItem;
 
     #[test]
     fn query_dim_check_skips_when_no_kb_is_loaded() {
@@ -333,14 +337,8 @@ mod tests {
     fn load_profile_keeps_kb_and_rejects_empty_profile() {
         let rt = tokio::runtime::Runtime::new().expect("tokio runtime");
         rt.block_on(async {
-            {
-                let mut e = ENGINE.write().await;
-                e.knowledge_store.dim = 3;
-                e.knowledge_store.items.push(SlimItem {
-                    id: Some("kb-1".to_string()),
-                    metadata: serde_json::Map::new(),
-                });
-            }
+            let kb = write_temp_profile("kb", r#"[{"id":"kb-1","vector":[1.0,0.0,0.0]}]"#);
+            load_knowledge_base(kb).await.expect("test KB must load");
 
             // 0.3.5 regression: swapping rules must keep the loaded KB and its dimension.
             let valid = write_temp_profile(
@@ -350,8 +348,8 @@ mod tests {
             load_profile(valid, None).await.expect("valid profile must load");
             {
                 let e = ENGINE.read().await;
-                assert_eq!(e.knowledge_store.dim, 3, "dim was reset by load_profile");
-                assert_eq!(e.knowledge_store.items.len(), 1, "KB items were dropped");
+                assert_eq!(e.knowledge_store.dim(), 3, "dim was reset by load_profile");
+                assert_eq!(e.knowledge_store.items().len(), 1, "KB items were dropped");
                 assert!(!e.translator.match_colloquial("foo").is_empty());
             }
 
@@ -360,8 +358,8 @@ mod tests {
             let err = load_profile(empty, None).await.expect_err("empty profile must be rejected");
             assert_eq!(err.reason, Profile::EMPTY_MESSAGE);
             let e = ENGINE.read().await;
-            assert_eq!(e.knowledge_store.dim, 3);
-            assert_eq!(e.knowledge_store.items.len(), 1);
+            assert_eq!(e.knowledge_store.dim(), 3);
+            assert_eq!(e.knowledge_store.items().len(), 1);
         });
     }
 }

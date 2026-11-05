@@ -22,6 +22,14 @@ fn s7_removed_dependencies_stay_removed() {
 }
 
 #[test]
+fn d11_store_fields_are_private() {
+    let src = read("src/knowledge_store.rs");
+    for field in ["pub items:", "pub dim:", "pub vectors_f16:", "pub hnsw:", "pub generation:"] {
+        assert!(!src.contains(field), "KnowledgeStore has a public field again: {field}");
+    }
+}
+
+#[test]
 fn d13_docs_match_code() {
     let readme = read("README.md");
     for stale in ["memmap2", "4-way unrolled", "mmap"] {
