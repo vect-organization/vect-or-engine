@@ -7,7 +7,8 @@
 use crate::profile::Profile;
 use aho_corasick::AhoCorasick;
 use crate::limits::MAX_REGEX_SIZE;
-use regex::{Regex, RegexBuilder};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -79,6 +80,7 @@ impl Matcher {
     }
 
     /// Byte offset of the first match, if any. Used for the marker's line number.
+    #[cfg(test)]
     fn find(&self, text: &str) -> Option<usize> {
         match self {
             Matcher::Literal(s) => text.find(s.as_str()),
@@ -95,9 +97,75 @@ impl Matcher {
     }
 }
 
+/// A trigger word plus its slots in the shared index.
+struct IndexedMatcher {
+    matcher: Matcher,
+    /// Pattern id in the shared Aho-Corasick automaton (literal side).
+    lit_id: Option<usize>,
+    /// Index in the shared `RegexSet` (regex side).
+    re_id: Option<usize>,
+}
+
 struct CompiledKeywordRule {
     warning_message: String,
-    matchers: Vec<Matcher>,
+    matchers: Vec<IndexedMatcher>,
+}
+
+/// One Aho-Corasick pass for all literal trigger words and one `RegexSet` pass for all regex
+/// trigger words (change-log P6), instead of one full-text scan per word.
+struct KeywordIndex {
+    ac: Option<AhoCorasick>,
+    set: Option<RegexSet>,
+}
+
+/// Presence of every indexed word in one text, plus where each literal first occurs.
+struct KeywordScan {
+    lit_first: Vec<Option<usize>>,
+    re_present: Vec<bool>,
+}
+
+impl KeywordIndex {
+    fn scan(&self, text: &str) -> KeywordScan {
+        let mut lit_first = Vec::new();
+        if let Some(ac) = &self.ac {
+            lit_first = vec![None; ac.patterns_len()];
+            for m in ac.find_overlapping_iter(text) {
+                let slot = &mut lit_first[m.pattern().as_usize()];
+                if slot.is_none_or(|s| m.start() < s) {
+                    *slot = Some(m.start());
+                }
+            }
+        }
+        let mut re_present = Vec::new();
+        if let Some(set) = &self.set {
+            re_present = vec![false; set.len()];
+            for i in set.matches(text).iter() {
+                re_present[i] = true;
+            }
+        }
+        KeywordScan { lit_first, re_present }
+    }
+}
+
+impl IndexedMatcher {
+    fn present(&self, scan: &KeywordScan) -> bool {
+        self.lit_id.is_some_and(|i| scan.lit_first[i].is_some())
+            || self.re_id.is_some_and(|i| scan.re_present[i])
+    }
+
+    /// First match offset; the literal side comes from the scan, a regex runs once on demand
+    /// (only for the first trigger word of a rule that fired).
+    fn first_offset(&self, scan: &KeywordScan, text: &str) -> Option<usize> {
+        let lit = self.lit_id.and_then(|i| scan.lit_first[i]);
+        let rx = match &self.matcher {
+            Matcher::Regex(re) | Matcher::Both(_, re) => re.find(text).map(|m| m.start()),
+            Matcher::Literal(_) => None,
+        };
+        match (lit, rx) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 pub struct Validator {
@@ -107,6 +175,7 @@ pub struct Validator {
     conflict_item_reasons: Vec<String>,
     min_value: u32,
     keyword_rules: Vec<CompiledKeywordRule>,
+    keyword_index: KeywordIndex,
 }
 
 impl Validator {
@@ -125,6 +194,9 @@ impl Validator {
         let mut value_regex = None;
         let mut value_warning_template = None;
         let mut keyword_rules = Vec::new();
+        let mut lit_words: Vec<String> = Vec::new();
+        let mut lit_index: HashMap<String, usize> = HashMap::new();
+        let mut re_words: Vec<String> = Vec::new();
 
         if let Some(rules) = &profile.assessment_rules {
             if let Some(template) = &rules.document_template {
@@ -158,8 +230,28 @@ impl Validator {
                     let matchers = rule
                         .trigger_words
                         .iter()
-                        .map(|w| Matcher::compile(w, mode))
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .map(|w| {
+                            let matcher = Matcher::compile(w, mode)?;
+                            let (lit, has_re) = match &matcher {
+                                Matcher::Literal(s) => (Some(s.as_str()), false),
+                                Matcher::Regex(_) => (None, true),
+                                Matcher::Both(s, _) => (Some(s.as_str()), true),
+                            };
+                            let lit_id = lit.map(|s| match lit_index.get(s) {
+                                Some(&id) => id,
+                                None => {
+                                    lit_words.push(s.to_string());
+                                    lit_index.insert(s.to_string(), lit_words.len() - 1);
+                                    lit_words.len() - 1
+                                }
+                            });
+                            let re_id = has_re.then(|| {
+                                re_words.push(w.clone());
+                                re_words.len() - 1
+                            });
+                            Ok(IndexedMatcher { matcher, lit_id, re_id })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
                     keyword_rules.push(CompiledKeywordRule {
                         warning_message: rule.warning_message.clone(),
                         matchers,
@@ -174,7 +266,28 @@ impl Validator {
             None
         };
 
+        let kw_ac = if lit_words.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasick::new(&lit_words)
+                    .map_err(|e| format!("cannot build the keyword automaton: {e}"))?,
+            )
+        };
+        // Every word was already compiled alone under MAX_REGEX_SIZE; the set limit is the sum.
+        let kw_set = if re_words.is_empty() {
+            None
+        } else {
+            Some(
+                RegexSetBuilder::new(&re_words)
+                    .size_limit(MAX_REGEX_SIZE.saturating_mul(re_words.len()))
+                    .build()
+                    .map_err(|e| format!("cannot build the keyword regex set: {e}"))?,
+            )
+        };
+
         Ok(Validator {
+            keyword_index: KeywordIndex { ac: kw_ac, set: kw_set },
             value_regex,
             value_warning_template,
             conflict_items_ac,
@@ -182,6 +295,30 @@ impl Validator {
             min_value,
             keyword_rules,
         })
+    }
+
+    /// Reference implementation of the keyword check before change-log P6: every trigger word
+    /// scans the whole text. Returns (rule index, first-trigger offset) for each rule that fires.
+    #[cfg(test)]
+    fn keyword_hits_per_trigger(&self, text: &str) -> Vec<(usize, Option<usize>)> {
+        self.keyword_rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.matchers.is_empty() && r.matchers.iter().all(|m| m.matcher.find(text).is_some()))
+            .map(|(i, r)| (i, r.matchers.first().and_then(|m| m.matcher.find(text))))
+            .collect()
+    }
+
+    /// Same result from the shared index (what `validate` uses).
+    #[cfg(test)]
+    fn keyword_hits_shared(&self, text: &str) -> Vec<(usize, Option<usize>)> {
+        let scan = self.keyword_index.scan(text);
+        self.keyword_rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.matchers.is_empty() && r.matchers.iter().all(|m| m.present(&scan)))
+            .map(|(i, r)| (i, r.matchers.first().and_then(|m| m.first_offset(&scan, text))))
+            .collect()
     }
 
     pub fn validate(&self, text: &str) -> ValidationResult {
@@ -244,15 +381,16 @@ impl Validator {
             }
         }
 
-        // 3. Keyword Rule Check (Dynamic)
+        // 3. Keyword Rule Check (Dynamic): one shared scan, then a lookup per rule (P6).
+        let scan = self.keyword_index.scan(text);
         for rule in &self.keyword_rules {
-            if !rule.matchers.is_empty() && rule.matchers.iter().all(|m| m.find(text).is_some()) {
+            if !rule.matchers.is_empty() && rule.matchers.iter().all(|m| m.present(&scan)) {
                 has_keyword_conflict = true;
                 let msg = rule.warning_message.clone();
                 keyword_message = Some(msg.clone());
                 // Find the line of the first trigger word.
                 let line = rule.matchers.first()
-                    .and_then(|m| m.find(text))
+                    .and_then(|m| m.first_offset(&scan, text))
                     .map(&offset_to_line)
                     .unwrap_or(1);
                 markers.push(ValidationMarker {
@@ -391,6 +529,42 @@ mod tests {
         let paren = Validator::with_mode(&keyword_profile("("), MatchMode::Both)
             .expect("both mode must accept a lone parenthesis");
         assert!(paren.validate("see (note)").has_keyword_conflict);
+    }
+
+    #[test]
+    fn p6_shared_index_matches_per_trigger_scan() {
+        // Single and multi-trigger rules, overlapping and repeated literals, regex words,
+        // and a word that is only a valid literal.
+        let json = r#"{"assessment_rules":{"keyword_rules":[
+            {"trigger_words":["abc"],"warning_message":"r0"},
+            {"trigger_words":["bc","a.c"],"warning_message":"r1"},
+            {"trigger_words":["G\\d+","note"],"warning_message":"r2"},
+            {"trigger_words":["C++"],"warning_message":"r3"},
+            {"trigger_words":["abc","zzz"],"warning_message":"r4"},
+            {"trigger_words":["x\\s+y"],"warning_message":"r5"}
+        ]}}"#;
+        let profile = Profile::load_from_json_str(json).unwrap();
+        let texts = [
+            "",
+            "abc",
+            "xxabcabc\nnote G42",
+            "a.c and bc here",
+            "line1\nline2\nG7 note\nabc",
+            "we use C++ and abc; zzz",
+            "x   y",
+            "日本語 abc ひらがな\nG1 note",
+            "bcabc",
+        ];
+        let mut compared = 0;
+        for mode in [MatchMode::Literal, MatchMode::Regex, MatchMode::Both] {
+            // Every word here compiles in all three modes ("C++" is a valid repetition).
+            let Ok(v) = Validator::with_mode(&profile, mode) else { continue };
+            for t in texts {
+                assert_eq!(v.keyword_hits_per_trigger(t), v.keyword_hits_shared(t), "mode {mode:?}, text {t:?}");
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 3 * texts.len());
     }
 
     #[test]
