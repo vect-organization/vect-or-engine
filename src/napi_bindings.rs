@@ -34,7 +34,11 @@ impl Engine {
 static ENGINE: LazyLock<Arc<RwLock<Engine>>> =
     LazyLock::new(|| Arc::new(RwLock::new(Engine::new(Profile::default()))));
 /// A simple ping function to verify the NAPI setup.
-#[napi]
+///
+/// Every synchronous export uses `catch_unwind` (change-log S5): a Rust panic would otherwise
+/// unwind across the C boundary and take the host process down. With it, the panic reaches
+/// JavaScript as an `Error` carrying the panic message.
+#[napi(catch_unwind)]
 pub fn ping(name: String) -> String {
   format!("pong from rust: {name}!")
 }
@@ -54,7 +58,7 @@ pub struct JsBuildInfo {
 }
 
 /// Returns the version, git hash, dirty flag and build time of this native binary.
-#[napi]
+#[napi(catch_unwind)]
 pub fn build_info() -> JsBuildInfo {
     JsBuildInfo {
         version: env!("CARGO_PKG_VERSION").to_string(),
@@ -137,8 +141,16 @@ impl From<ValidationResult> for JsValidationResult {
 
 // --- Exposed N-API Functions ---
 
+/// Test hook (feature `test-hooks`, never in a release build): panics on purpose so a Node
+/// test can check that the panic arrives in JavaScript as an `Error` (change-log S5).
+#[cfg(feature = "test-hooks")]
+#[napi(catch_unwind)]
+pub fn force_panic_for_test() -> Result<()> {
+    panic!("forced panic for test");
+}
+
 /// Validates a document using the currently loaded profile.
-#[napi]
+#[napi(catch_unwind)]
 pub fn validate_sync(text: String) -> Result<JsValidationResult> {
     let engine = ENGINE.blocking_read();
     let result = engine.validator.validate(&text);
