@@ -7,16 +7,15 @@
 //! - Vectors are 384-dimensional and L2-normalised, generated from a fixed seed (no external data).
 //! - Two data shapes: `uniform` (random directions, the hardest case for graph search) and
 //!   `clustered` (50 centres plus noise, closer to real sentence embeddings).
-//! - Vectors are quantised to f16 and back before indexing, like `KnowledgeStore::build_index`.
-//! - Ground truth is an exact f32 scan over the original vectors, so recall includes the
-//!   quantisation loss.
+//! - Vectors are indexed as exact f32, like `KnowledgeStore::build_index` since 0.3.10 (earlier
+//!   versions rounded through f16 first, so recall figures before and after differ by that loss).
+//! - Ground truth is an exact f32 scan over the original vectors.
 //! - Latency is single-threaded, one query at a time, wall clock per query.
 //! - The validator section measures keyword-rule scaling; it does not use the N-API layer.
 
 use std::fmt::Write as _;
 use std::time::Instant;
 
-use half::f16;
 use vect_or_engine::hnsw_index::{dot_product_simd, HnswIndex, HnswParams};
 use vect_or_engine::{MatchMode, Profile, Validator};
 
@@ -140,13 +139,9 @@ fn run_vector(
     let data = generate(rng, shape, centres, n, dim);
     let qs = generate(rng, shape, centres, queries, dim);
 
-    // Same path as KnowledgeStore::build_index: f32 -> f16 -> f32, then build.
-    let dequant: Vec<Vec<f32>> = data
-        .iter()
-        .map(|v| v.iter().map(|&x| f32::from(f16::from_f32(x))).collect())
-        .collect();
+    // Same path as KnowledgeStore::build_index since 0.3.10: exact f32, no f16 round trip.
     let t = Instant::now();
-    let index = HnswIndex::build_with(*params, &dequant);
+    let index = HnswIndex::build_with(*params, &data).expect("equal-length vectors");
     let build_s = t.elapsed().as_secs_f64();
 
     let mut hits = 0usize;
@@ -164,7 +159,7 @@ fn run_vector(
     let mut scan_us: Vec<f64> = Vec::with_capacity(sample);
     for q in qs.iter().take(sample) {
         let t = Instant::now();
-        let _ = exact_top_k(&dequant, q, TOP_K);
+        let _ = exact_top_k(&data, q, TOP_K);
         scan_us.push(t.elapsed().as_secs_f64() * 1e6);
     }
 

@@ -13,11 +13,20 @@
 //! Design decisions:
 //! - Pure Rust, zero external ANN crates (no FFI dependencies).
 //! - Negative dot-product as distance (HNSW minimises; caller maximises similarity).
-//! - Safe 8-wide chunked dot product — the compiler vectorises it at the target's baseline (SSE2 by default).
+//! - One safe 16-lane dot product (`crate::matrix::dot`), shared with the exact scan, so every
+//!   path adds in the same order (change-log P4, R5).
+//! - The vectors live in a shared `VectorMatrix` (P3); the index stores only the graph.
 //! - `select_nth_unstable` for O(N) top-K without full sort.
 
 use std::cmp::Ordering;
 use std::collections::{BinaryHeap, HashSet};
+use std::sync::Arc;
+
+use crate::engine_error::EngineError;
+use crate::matrix::{dot, VectorMatrix};
+
+/// The dot product used by every search path (see `crate::matrix::dot` for the summation order).
+pub use crate::matrix::dot as dot_product_simd;
 
 // ─── Tuneable constants ────────────────────────────────────────────────────────
 /// Max bi-directional connections per node per layer.
@@ -92,9 +101,8 @@ impl Ord for MaxCand {
 
 // ─── HNSW Index ───────────────────────────────────────────────────────────────
 
-/// Stored node: vector + per-layer neighbour lists.
+/// Stored node: per-layer neighbour lists. The vector is row `i` of the shared matrix.
 struct Node {
-    vector: Vec<f32>,
     /// `layers[lc]` = neighbour node indices at layer `lc`.
     layers: Vec<Vec<usize>>,
 }
@@ -102,6 +110,8 @@ struct Node {
 /// HNSW approximate nearest-neighbour index over f32 vectors.
 #[derive(Default)]
 pub struct HnswIndex {
+    /// Row `i` is the vector of node `i`. Shared with the knowledge base, never copied.
+    matrix: Arc<VectorMatrix>,
     nodes: Vec<Node>,
     entry_point: Option<usize>,
     max_layer: usize,
@@ -119,6 +129,7 @@ impl HnswIndex {
     /// Create an empty index with the given parameters.
     pub fn with_params(params: HnswParams) -> Self {
         HnswIndex {
+            matrix: Arc::new(VectorMatrix::default()),
             nodes: Vec::new(),
             entry_point: None,
             max_layer: 0,
@@ -127,16 +138,25 @@ impl HnswIndex {
         }
     }
 
-    /// Build index from a slice of vectors (sequential; call from `spawn_blocking`).
-    pub fn build(vectors: &[Vec<f32>]) -> Self {
+    /// Build index from a slice of vectors (sequential; call from `spawn_blocking`). Every
+    /// vector must have the length of the first one.
+    pub fn build(vectors: &[Vec<f32>]) -> Result<Self, EngineError> {
         Self::build_with(HnswParams::default(), vectors)
     }
 
     /// Build index with explicit parameters (used by the benchmark).
-    pub fn build_with(params: HnswParams, vectors: &[Vec<f32>]) -> Self {
+    pub fn build_with(params: HnswParams, vectors: &[Vec<f32>]) -> Result<Self, EngineError> {
+        let matrix = VectorMatrix::from_rows(vectors)?;
+        Ok(Self::build_from_matrix(params, matrix.into_shared()))
+    }
+
+    /// Build an index over a shared matrix without copying it (sequential, deterministic:
+    /// the same matrix and parameters give the same graph). Node `i` is row `i`.
+    pub fn build_from_matrix(params: HnswParams, matrix: Arc<VectorMatrix>) -> Self {
         let mut idx = HnswIndex::with_params(params);
-        for v in vectors {
-            idx.insert(v);
+        idx.matrix = matrix;
+        for id in 0..idx.matrix.len() {
+            idx.link(id);
         }
         idx
     }
@@ -173,7 +193,7 @@ impl HnswIndex {
     /// Negative dot product — HNSW minimises distance; we want max similarity.
     #[inline(always)]
     fn dist(a: &[f32], b: &[f32]) -> f32 {
-        -dot_product_simd(a, b)
+        -dot(a, b)
     }
 
     // ── Core: search within one layer ────────────────────────────────────────
@@ -186,7 +206,7 @@ impl HnswIndex {
         layer: usize,
     ) -> Vec<(f32, usize)> {
         let mut visited: HashSet<usize> = HashSet::new();
-        let ep_dist = Self::dist(query, &self.nodes[entry].vector);
+        let ep_dist = Self::dist(query, self.matrix.row(entry));
 
         let mut candidates: BinaryHeap<MinCand> = BinaryHeap::new();
         let mut window: BinaryHeap<MaxCand> = BinaryHeap::new();
@@ -216,7 +236,7 @@ impl HnswIndex {
                 }
                 visited.insert(nb);
 
-                let nb_dist = Self::dist(query, &self.nodes[nb].vector);
+                let nb_dist = Self::dist(query, self.matrix.row(nb));
                 let worst = window.peek().map(|x| x.0).unwrap_or(f32::MAX);
 
                 if nb_dist < worst || window.len() < ef {
@@ -229,10 +249,11 @@ impl HnswIndex {
             }
         }
 
-        // Collect and sort ascending by distance.
+        // Collect and sort ascending by distance; equal distances go by node id (R1), so the
+        // order never depends on heap internals.
         let mut result: Vec<(f32, usize)> =
             window.into_iter().map(|x| (x.0, x.1)).collect();
-        result.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+        result.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         result
     }
 
@@ -259,10 +280,10 @@ impl HnswIndex {
             if kept.len() >= max {
                 break;
             }
-            let c_vec = &self.nodes[c].vector;
+            let c_vec = self.matrix.row(c);
             let diverse = kept
                 .iter()
-                .all(|&s| d_base < Self::dist(c_vec, &self.nodes[s].vector));
+                .all(|&s| d_base < Self::dist(c_vec, self.matrix.row(s)));
             if diverse {
                 kept.push(c);
             } else {
@@ -280,21 +301,30 @@ impl HnswIndex {
         kept
     }
 
-    /// Insert one vector into the index; returns the assigned node ID.
-    pub fn insert(&mut self, vector: &[f32]) -> usize {
+    /// Insert one vector into the index; returns the assigned node ID. The vector must have
+    /// the index's dimension (the first insert sets it). If the matrix is shared with a
+    /// knowledge base, it is copied first, so the knowledge base is never changed.
+    pub fn insert(&mut self, vector: &[f32]) -> Result<usize, EngineError> {
+        Arc::make_mut(&mut self.matrix).push_row(vector)?;
         let node_id = self.nodes.len();
+        debug_assert_eq!(self.matrix.len(), node_id + 1);
+        self.link(node_id);
+        Ok(node_id)
+    }
+
+    /// Add node `node_id` (row `node_id` of the matrix) to the graph.
+    fn link(&mut self, node_id: usize) {
+        let matrix = Arc::clone(&self.matrix);
+        let vector = matrix.row(node_id);
         let node_layer = self.next_layer();
 
-        self.nodes.push(Node {
-            vector: vector.to_vec(),
-            layers: vec![Vec::new(); node_layer + 1],
-        });
+        self.nodes.push(Node { layers: vec![Vec::new(); node_layer + 1] });
 
         let Some(mut ep) = self.entry_point else {
             // First node — becomes entry point.
             self.entry_point = Some(node_id);
             self.max_layer = node_layer;
-            return node_id;
+            return;
         };
 
         let top = self.max_layer;
@@ -327,11 +357,11 @@ impl HnswIndex {
                 conn.push(node_id);
 
                 if conn.len() > cap {
-                    let nb_vec = &self.nodes[nb].vector;
+                    let nb_vec = matrix.row(nb);
                     let mut distances: Vec<(f32, usize)> = conn.iter()
-                        .map(|&idx| (Self::dist(nb_vec, &self.nodes[idx].vector), idx))
+                        .map(|&idx| (Self::dist(nb_vec, matrix.row(idx)), idx))
                         .collect();
-                    distances.sort_unstable_by(|a, b| a.0.total_cmp(&b.0));
+                    distances.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
                     conn = self.select_neighbours(&distances, cap);
                 }
                 self.nodes[nb].layers[lc] = conn;
@@ -347,8 +377,6 @@ impl HnswIndex {
             self.max_layer = node_layer;
             self.entry_point = Some(node_id);
         }
-
-        node_id
     }
 
     // ── Query ─────────────────────────────────────────────────────────────────
@@ -384,30 +412,6 @@ impl HnswIndex {
             .map(|(dist, idx)| (-dist, idx)) // negate back → dot-product score
             .collect()
     }
-}
-
-// ─── SIMD-friendly dot product ────────────────────────────────────────────────
-
-/// Dot product in safe Rust: 8 independent accumulators over fixed-size chunks (no bounds
-/// checks in the hot loop), then a scalar tail. With `opt-level=3` the compiler vectorises
-/// it at the build target's baseline (SSE2 unless `target-cpu` is raised).
-#[inline(always)]
-pub fn dot_product_simd(a: &[f32], b: &[f32]) -> f32 {
-    let n = a.len().min(b.len());
-    let (a, b) = (&a[..n], &b[..n]);
-    let mut acc = [0.0f32; 8];
-    let mut ca = a.chunks_exact(8);
-    let mut cb = b.chunks_exact(8);
-    for (x, y) in (&mut ca).zip(&mut cb) {
-        for k in 0..8 {
-            acc[k] += x[k] * y[k];
-        }
-    }
-    let mut sum = acc.iter().sum::<f32>();
-    for (x, y) in ca.remainder().iter().zip(cb.remainder()) {
-        sum += x * y;
-    }
-    sum
 }
 
 // ─── Tests ────────────────────────────────────────────────────────────────────
@@ -447,8 +451,8 @@ mod tests {
         let mut heur = HnswIndex::with_params(HnswParams { heuristic: true, ..HnswParams::default() });
         let mut plain = HnswIndex::with_params(HnswParams { heuristic: false, ..HnswParams::default() });
         for v in &nodes {
-            heur.insert(v);
-            plain.insert(v);
+            heur.insert(v).unwrap();
+            plain.insert(v).unwrap();
         }
 
         // Nearest-M keeps B and C (both on the same side).
@@ -458,11 +462,43 @@ mod tests {
     }
 
     #[test]
+    fn r1_hnsw_ties_are_ordered_by_node_id() {
+        // Eight identical vectors: every score ties, so only the node id can order the result.
+        let mut idx = HnswIndex::new();
+        for _ in 0..8 {
+            idx.insert(&[1.0, 0.0, 0.0, 0.0]).unwrap();
+        }
+        let ids: Vec<usize> = idx.search(&[1.0, 0.0, 0.0, 0.0], 5).into_iter().map(|(_, i)| i).collect();
+        assert_eq!(ids, vec![0, 1, 2, 3, 4]);
+    }
+
+    #[test]
+    fn r2_two_builds_equal() {
+        // The same matrix and parameters give the same graph, so the same answers.
+        let rows: Vec<Vec<f32>> = (0..300)
+            .map(|i| (0..16).map(|j| (((i * 31 + j * 17) % 23) as f32) - 11.0).collect())
+            .collect();
+        let a = HnswIndex::build(&rows).unwrap();
+        let b = HnswIndex::build(&rows).unwrap();
+        for q in rows.iter().step_by(37) {
+            assert_eq!(a.search(q, 10), b.search(q, 10));
+        }
+    }
+
+    #[test]
+    fn insert_rejects_a_vector_of_another_dimension() {
+        let mut idx = HnswIndex::new();
+        idx.insert(&[1.0, 0.0]).unwrap();
+        assert!(idx.insert(&[1.0, 0.0, 0.0]).is_err());
+        assert_eq!(idx.len(), 1);
+    }
+
+    #[test]
     fn hnsw_basic_search() {
         let mut idx = HnswIndex::new();
         for i in 0..64usize {
             let v: Vec<f32> = (0..64).map(|j| if j == i { 1.0 } else { 0.0 }).collect();
-            idx.insert(&v);
+            idx.insert(&v).unwrap();
         }
         assert_eq!(idx.len(), 64);
 

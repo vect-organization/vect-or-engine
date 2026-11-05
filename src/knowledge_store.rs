@@ -8,7 +8,8 @@
 //!
 //! Optimisations layered in this module:
 //!  1. **fs::read**       — the JSON file is read once and parsed (no unsafe, no mmap).
-//!  2. **f16 quantisation** — vectors stored as 16-bit floats (50 % memory).
+//!  2. **Flat f32 matrix** — one contiguous `VectorMatrix` shared by the exact scan and the
+//!     HNSW index (P3); f16 is only the SQLite cache format.
 //!  3. **rayon**          — parallel linear scan for mid-size datasets.
 //!  4. **HnswIndex**      — O(log N) approximate search for large datasets.
 //!  5. **SQLite cache**   — avoids re-parsing JSON on every restart.
@@ -17,11 +18,13 @@ use half::f16;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
 use std::fs;
+use std::sync::Arc;
 
 use crate::limits::{F16_MAX_ABS, MAX_KB_BYTES, MAX_TOP_K};
+use crate::matrix::{dot, VectorMatrix};
 
 use crate::engine_error::EngineError;
-use crate::hnsw_index::HnswIndex;
+use crate::hnsw_index::{HnswIndex, HnswParams};
 
 // ─── Public data types ────────────────────────────────────────────────────────
 
@@ -95,12 +98,10 @@ pub struct KnowledgeStore {
     /// Metadata for each item (id + arbitrary JSON fields). Private (D11): the vectors, the
     /// dimension and the index must stay in step, so callers read through accessors.
     items: Vec<SlimItem>,
-    /// f16-quantised vectors — parallel to `items`.
-    vectors_f16: Vec<Vec<f16>>,
+    /// Exact f32 vectors, row `i` for `items[i]`. Shared with the HNSW index, never copied.
+    matrix: Arc<VectorMatrix>,
     /// HNSW index (built on demand via `build_index`).
     hnsw: Option<HnswIndex>,
-    /// Expected vector dimensionality (set by every successful load).
-    dim: usize,
     /// Bumped by every load. An index built off-lock (P1) is installed only if this is
     /// still the value it was built from.
     generation: u64,
@@ -116,16 +117,15 @@ impl KnowledgeStore {
     pub fn new() -> Self {
         KnowledgeStore {
             items: Vec::new(),
-            vectors_f16: Vec::new(),
+            matrix: Arc::new(VectorMatrix::default()),
             hnsw: None,
-            dim: 0,
             generation: 0,
         }
     }
 
     /// Vector dimensionality of the loaded knowledge base (0 when nothing is loaded).
     pub fn dim(&self) -> usize {
-        self.dim
+        self.matrix.dim()
     }
 
     /// Metadata of the loaded items, in load order.
@@ -150,9 +150,10 @@ impl KnowledgeStore {
 
     /// Load knowledge base from a JSON file.
     ///
-    /// The file is read and parsed once; vectors are quantised to f16 on the fly.
-    /// Files larger than `MAX_KB_BYTES`, zero-length vectors and non-finite or
-    /// f16-overflowing components are rejected. Returns the number of items loaded.
+    /// The file is read and parsed once; vectors are kept as exact f32.
+    /// Files larger than `MAX_KB_BYTES`, zero-length vectors and non-finite components are
+    /// rejected, and so is a component beyond f16 range, because the SQLite cache stores f16.
+    /// Returns the number of items loaded.
     pub fn load_from_path(&mut self, path: &str) -> Result<usize, EngineError> {
         let size = fs::metadata(path)?.len();
         if size > MAX_KB_BYTES {
@@ -177,7 +178,7 @@ impl KnowledgeStore {
 
         // D1: build into locals; `self` is touched only after every item has passed.
         let mut items = Vec::with_capacity(count);
-        let mut vectors_f16 = Vec::with_capacity(count);
+        let mut data: Vec<f32> = Vec::with_capacity(count * new_dim);
         for (i, item) in raw.into_iter().enumerate() {
             if item.vector.len() != new_dim {
                 return Err(EngineError::DimensionMismatch { expected: new_dim, got: item.vector.len() });
@@ -187,20 +188,20 @@ impl KnowledgeStore {
                     "item #{i} has a vector component {x} that is not finite or exceeds {F16_MAX_ABS}"
                 )));
             }
-            vectors_f16.push(item.vector.iter().map(|&x| f16::from_f32(x)).collect::<Vec<f16>>());
+            data.extend_from_slice(&item.vector);
             items.push(SlimItem { id: item.id, metadata: item.metadata });
         }
 
-        self.install(items, vectors_f16, new_dim);
+        self.install(items, VectorMatrix::from_flat(new_dim, data)?);
         Ok(count)
     }
 
     /// Replace the whole knowledge base in one step: items, vectors, dimension, a dropped
     /// index and a new generation. The only place the parallel vectors change.
-    fn install(&mut self, items: Vec<SlimItem>, vectors_f16: Vec<Vec<f16>>, dim: usize) {
+    fn install(&mut self, items: Vec<SlimItem>, matrix: VectorMatrix) {
+        debug_assert_eq!(items.len(), matrix.len());
         self.items = items;
-        self.vectors_f16 = vectors_f16;
-        self.dim = dim;
+        self.matrix = matrix.into_shared();
         self.hnsw = None;
         self.generation += 1;
     }
@@ -223,17 +224,11 @@ impl KnowledgeStore {
         self.hnsw = Some(self.index_job().build().index);
     }
 
-    /// P1: copy what an index build needs, so the build can run without holding the engine
-    /// lock. Pair with `install_index`.
+    /// P1: hand out what an index build needs (a shared matrix, no copy), so the build can run
+    /// without holding the engine lock. Pair with `install_index`.
     pub fn index_job(&self) -> IndexJob {
-        IndexJob {
-            generation: self.generation,
-            vectors: self
-                .vectors_f16
-                .iter()
-                .map(|v| v.iter().map(|&x| f32::from(x)).collect())
-                .collect(),
-        }
+        // P3: the matrix is shared, not copied; the store never mutates it in place.
+        IndexJob { generation: self.generation, matrix: Arc::clone(&self.matrix) }
     }
 
     /// Install an index built from `index_job`. Fails when the knowledge base was loaded
@@ -284,27 +279,25 @@ impl KnowledgeStore {
         self.search_query(&SearchQuery::new(query).with_top_k(top_k))
     }
 
-    /// Parallel rayon linear scan — O(N); the f16 dot product is safe code the compiler can vectorise.
+    /// Parallel rayon linear scan — O(N) over the shared f32 matrix, with the same `dot` the
+    /// index uses. Results are ordered by score descending, equal scores by idx ascending (R1).
     ///
     /// Suitable for ≤ ~10 K items or when HNSW is not yet built.
     pub fn linear_search(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
-        let mut scores: Vec<(f32, usize)> = self
-            .vectors_f16
-            .par_iter()
-            .enumerate()
-            .map(|(idx, v)| {
-                let score = dot_product_f16(query, v);
-                (score, idx)
-            })
+        let matrix = &self.matrix;
+        let mut scores: Vec<(f32, usize)> = (0..matrix.len())
+            .into_par_iter()
+            .map(|idx| (dot(query, matrix.row(idx)), idx))
             .collect();
 
+        // A total order (the idx is unique), so the selection and the sort are deterministic.
+        let by_rank = |a: &(f32, usize), b: &(f32, usize)| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1));
         // O(N) partial selection — avoids full sort.
-        let n = scores.len();
-        if n > top_k {
-            scores.select_nth_unstable_by(top_k, |a, b| b.0.total_cmp(&a.0));
+        if scores.len() > top_k {
+            scores.select_nth_unstable_by(top_k, by_rank);
             scores.truncate(top_k);
         }
-        scores.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
+        scores.sort_unstable_by(by_rank);
 
         scores
             .into_iter()
@@ -314,10 +307,12 @@ impl KnowledgeStore {
 
     // ── SQLite persistence ────────────────────────────────────────────────────
 
-    /// Persist the current knowledge base metadata to a SQLite database.
+    /// Persist the current knowledge base to a SQLite database. Vectors are written as f16, so
+    /// a knowledge base loaded back from the cache scores slightly differently from the JSON
+    /// it came from.
     ///
     /// Subsequent startups can call `load_from_sqlite` for faster startup
-    /// (avoids re-parsing the JSON file and re-quantising vectors).
+    /// (avoids re-parsing the JSON file).
     pub fn save_to_sqlite(&self, db_path: &str) -> Result<(), EngineError> {
         let conn = rusqlite::Connection::open(db_path)
             .map_err(|e| EngineError::Database(e.to_string()))?;
@@ -337,10 +332,15 @@ impl KnowledgeStore {
             "INSERT INTO kb_items (idx, id, metadata, vector_f16) VALUES (?1,?2,?3,?4)"
         ).map_err(|e| EngineError::Database(e.to_string()))?;
 
-        for (i, (item, f16v)) in self.items.iter().zip(self.vectors_f16.iter()).enumerate() {
+        for (i, item) in self.items.iter().enumerate() {
             let metadata_json = serde_json::to_string(&item.metadata)?;
-            // Store f16 vector as raw bytes (little-endian).
-            let blob: Vec<u8> = f16v.iter().flat_map(|x| x.to_le_bytes()).collect();
+            // The cache format is f16, little-endian (the runtime copy stays exact f32).
+            let blob: Vec<u8> = self
+                .matrix
+                .row(i)
+                .iter()
+                .flat_map(|&x| f16::from_f32(x).to_le_bytes())
+                .collect();
             stmt.execute(rusqlite::params![i as i64, item.id, metadata_json, blob])
                 .map_err(|e| EngineError::Database(e.to_string()))?;
         }
@@ -370,7 +370,7 @@ impl KnowledgeStore {
             .map_err(|e| EngineError::Database(e.to_string()))?;
 
         let mut items = Vec::new();
-        let mut vectors_f16: Vec<Vec<f16>> = Vec::new();
+        let mut data: Vec<f32> = Vec::new();
         let mut dim = 0usize;
         let mut n = 0usize;
         for row in &mut rows {
@@ -383,17 +383,20 @@ impl KnowledgeStore {
             }
             let metadata: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&meta_json)
                 .map_err(|e| EngineError::InvalidInput(format!("cache row #{n} has invalid metadata: {e}")))?;
-            let f16v: Vec<f16> = blob.chunks_exact(2).map(|b| f16::from_le_bytes([b[0], b[1]])).collect();
+            let row: Vec<f32> = blob
+                .chunks_exact(2)
+                .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
+                .collect();
             if n == 0 {
-                dim = f16v.len();
-            } else if f16v.len() != dim {
-                return Err(EngineError::DimensionMismatch { expected: dim, got: f16v.len() });
+                dim = row.len();
+            } else if row.len() != dim {
+                return Err(EngineError::DimensionMismatch { expected: dim, got: row.len() });
             }
-            if f16v.iter().any(|x| !x.is_finite()) {
+            if row.iter().any(|x| !x.is_finite()) {
                 return Err(EngineError::InvalidInput(format!("cache row #{n} has a non-finite component")));
             }
             items.push(SlimItem { id, metadata });
-            vectors_f16.push(f16v);
+            data.extend_from_slice(&row);
             n += 1;
         }
         drop(rows);
@@ -401,7 +404,7 @@ impl KnowledgeStore {
             return Err(EngineError::InvalidInput("the cache contains no items".into()));
         }
 
-        self.install(items, vectors_f16, dim);
+        self.install(items, VectorMatrix::from_flat(dim, data)?);
         Ok(n)
     }
 
@@ -420,16 +423,19 @@ impl KnowledgeStore {
 
 // ─── Off-lock index build (P1) ───────────────────────────────────────────────
 
-/// A snapshot of the vectors to index; owns its data, so it can move to another thread.
+/// The vectors to index (a shared, immutable matrix), so the job can move to another thread.
 pub struct IndexJob {
     generation: u64,
-    vectors: Vec<Vec<f32>>,
+    matrix: Arc<VectorMatrix>,
 }
 
 impl IndexJob {
     /// CPU-intensive; run it on a blocking thread, with no engine lock held.
     pub fn build(self) -> BuiltIndex {
-        BuiltIndex { generation: self.generation, index: HnswIndex::build(&self.vectors) }
+        BuiltIndex {
+            generation: self.generation,
+            index: HnswIndex::build_from_matrix(HnswParams::default(), self.matrix),
+        }
     }
 }
 
@@ -461,29 +467,6 @@ impl SearchResult {
     }
 }
 
-// ─── SIMD-friendly f16 dot product ───────────────────────────────────────────
-
-/// Dot product between an f32 query and an f16-stored vector. Safe code only: fixed
-/// 8-wide chunks give the compiler bounds-check-free loops it can vectorise.
-#[inline(always)]
-fn dot_product_f16(query: &[f32], stored: &[f16]) -> f32 {
-    let n = query.len().min(stored.len());
-    let (query, stored) = (&query[..n], &stored[..n]);
-    let mut acc = [0.0f32; 8];
-    let mut q_chunks = query.chunks_exact(8);
-    let mut s_chunks = stored.chunks_exact(8);
-    for (q, s) in (&mut q_chunks).zip(&mut s_chunks) {
-        for k in 0..8 {
-            acc[k] += q[k] * f32::from(s[k]);
-        }
-    }
-    let mut sum = acc.iter().sum::<f32>();
-    for (q, s) in q_chunks.remainder().iter().zip(s_chunks.remainder()) {
-        sum += q * f32::from(*s);
-    }
-    sum
-}
-
 // ─── Tests ────────────────────────────────────────────────────────────────────
 
 #[cfg(test)]
@@ -492,17 +475,16 @@ mod tests {
 
     fn make_store(n: usize, dim: usize) -> KnowledgeStore {
         let mut store = KnowledgeStore::new();
-        store.dim = dim;
+        let mut data = Vec::with_capacity(n * dim);
+        let mut items = Vec::with_capacity(n);
         for i in 0..n {
-            let v: Vec<f16> = (0..dim)
-                .map(|j| f16::from_f32(if j == i % dim { 1.0 } else { 0.0 }))
-                .collect();
-            store.vectors_f16.push(v);
-            store.items.push(SlimItem {
+            data.extend((0..dim).map(|j| if j == i % dim { 1.0f32 } else { 0.0 }));
+            items.push(SlimItem {
                 id: Some(format!("item-{i}")),
                 metadata: serde_json::Map::new(),
             });
         }
+        store.install(items, VectorMatrix::from_flat(dim, data).unwrap());
         store
     }
 
@@ -645,11 +627,39 @@ mod tests {
     }
 
     #[test]
-    fn safe_dot_matches_a_plain_sum() {
-        let q: Vec<f32> = (0..21).map(|i| i as f32 * 0.5).collect();
-        let s: Vec<f16> = (0..21).map(|i| f16::from_f32(1.0 + i as f32)).collect();
-        let want: f32 = q.iter().zip(&s).map(|(a, b)| a * f32::from(*b)).sum();
-        assert!((dot_product_f16(&q, &s) - want).abs() < 1e-3);
+    fn r1_ties_ordered_by_idx() {
+        // Five identical vectors tie on every score: both search paths must return idx order.
+        let mut store = KnowledgeStore::new();
+        let kb = write_kb(
+            r#"[{"id":"a","vector":[1.0,0.0]},{"id":"b","vector":[1.0,0.0]},{"id":"c","vector":[1.0,0.0]},{"id":"d","vector":[1.0,0.0]},{"id":"e","vector":[1.0,0.0]},{"id":"f","vector":[0.0,1.0]}]"#,
+        );
+        store.load_from_path(&kb).unwrap();
+        let idxs = |r: Vec<SearchResult>| r.into_iter().map(|x| x.idx).collect::<Vec<_>>();
+        assert_eq!(idxs(store.linear_search(&[1.0, 0.0], 4)), vec![0, 1, 2, 3]);
+        store.build_index();
+        assert_eq!(idxs(store.search(&[1.0, 0.0], 4)), vec![0, 1, 2, 3]);
+        std::fs::remove_file(kb).ok();
+    }
+
+    #[test]
+    fn p3_index_and_store_share_one_matrix() {
+        let mut store = make_store(30, 8);
+        let job = store.index_job();
+        assert!(Arc::ptr_eq(&job.matrix, &store.matrix), "the index job must not copy the vectors");
+        let built = job.build();
+        store.install_index(built).unwrap();
+        assert!(store.has_index());
+    }
+
+    #[test]
+    fn a3_scores_are_exact_f32_not_f16_rounded() {
+        // 0.1 is not representable in f16 (it rounds to 0.099975586); f32 keeps it.
+        let mut store = KnowledgeStore::new();
+        let kb = write_kb(r#"[{"id":"a","vector":[0.1,0.0]}]"#);
+        store.load_from_path(&kb).unwrap();
+        let score = store.linear_search(&[1.0, 0.0], 1)[0].score;
+        assert_eq!(score, 0.1f32);
+        std::fs::remove_file(kb).ok();
     }
 
     #[test]
