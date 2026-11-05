@@ -22,7 +22,7 @@ pub use matrix::{dot, VectorMatrix};
 pub use knowledge_store::{BuiltIndex, IndexJob, KnowledgeItem, KnowledgeStore, NormReport, SearchQuery, SearchResult};
 pub use profile::Profile;
 pub use translator::{TranslationMatch, Translator};
-pub use validator::{MatchMode, ValidationMarker, ValidationResult, Validator};
+pub use validator::{normalize_with_offsets, MatchMode, ValidationMarker, ValidationResult, Validator};
 
 #[cfg(feature = "napi")]
 mod napi_bindings;

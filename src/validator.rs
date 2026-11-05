@@ -60,7 +60,10 @@ enum Matcher {
 }
 
 impl Matcher {
-    fn compile(word: &str, mode: MatchMode) -> Result<Self, String> {
+    fn compile(word: &str, mode: MatchMode, normalize: bool) -> Result<Self, String> {
+        // Literal words are folded like the text when A6 normalization is on; regexes are not
+        // rewritten (write them against the folded text).
+        let literal = if normalize { normalize_with_offsets(word).0 } else { word.to_string() };
         let regex = || {
             RegexBuilder::new(word)
                 .size_limit(MAX_REGEX_SIZE)
@@ -68,13 +71,13 @@ impl Matcher {
                 .map_err(|e| format!("invalid regex '{word}' in keyword rule: {e}"))
         };
         Ok(match mode {
-            MatchMode::Literal => Matcher::Literal(word.to_string()),
+            MatchMode::Literal => Matcher::Literal(literal),
             MatchMode::Regex => Matcher::Regex(regex()?),
             // `both` must not reject a word that is only a valid literal (e.g. "C++", "("):
             // if it is not a valid regex, it simply matches as literal text.
             MatchMode::Both => match regex() {
-                Ok(re) => Matcher::Both(word.to_string(), re),
-                Err(_) => Matcher::Literal(word.to_string()),
+                Ok(re) => Matcher::Both(literal, re),
+                Err(_) => Matcher::Literal(literal),
             },
         })
     }
@@ -176,6 +179,47 @@ pub struct Validator {
     min_value: u32,
     keyword_rules: Vec<CompiledKeywordRule>,
     keyword_index: KeywordIndex,
+    /// A6: match against NFKC-normalized, lower-cased text (offsets map back to the original).
+    normalize: bool,
+}
+
+/// NFKC-normalizes and lower-cases `text` and returns it with an offset map: entry `i` is the
+/// byte offset in `text` of the original character that produced byte `i` of the result, and
+/// the last entry is `text.len()` (change-log A6). A starter character and the combining marks
+/// that follow it are normalized together, so "か" + "゛" composes to "が" and maps to the
+/// starter's offset. Composition across two starters (Hangul jamo) is not attempted.
+pub fn normalize_with_offsets(text: &str) -> (String, Vec<usize>) {
+    use unicode_normalization::{char::canonical_combining_class, UnicodeNormalization};
+    let mut out = String::with_capacity(text.len());
+    let mut map: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    let mut chunk = String::new();
+    let mut chunk_start = 0usize;
+    let flush = |chunk: &mut String, start: usize, out: &mut String, map: &mut Vec<usize>| {
+        for c in chunk.chars().nfkc().flat_map(|c| c.to_lowercase()) {
+            out.push(c);
+            map.extend(std::iter::repeat_n(start, c.len_utf8()));
+        }
+        chunk.clear();
+    };
+    for (i, ch) in text.char_indices() {
+        let continues = ch
+            .to_string()
+            .nfkc()
+            .next()
+            .is_some_and(|f| canonical_combining_class(f) != 0);
+        if !continues {
+            flush(&mut chunk, chunk_start, &mut out, &mut map);
+            chunk_start = i;
+        }
+        chunk.push(ch);
+    }
+    flush(&mut chunk, chunk_start, &mut out, &mut map);
+    map.push(text.len());
+    (out, map)
+}
+
+fn fold_text(s: &str) -> String {
+    normalize_with_offsets(s).0
 }
 
 impl Validator {
@@ -188,6 +232,14 @@ impl Validator {
     /// Builds the validator with the given keyword matching mode. Fails on an invalid regex,
     /// so the caller can keep the previously loaded rules.
     pub fn with_mode(profile: &Profile, mode: MatchMode) -> Result<Self, String> {
+        Self::with_options(profile, mode, false)
+    }
+
+    /// Like `with_mode`, with the opt-in A6 text normalization: the document and the literal
+    /// words are NFKC-normalized and lower-cased before matching, so full-width codes and
+    /// upper/lower case variants hit. Marker lines still refer to the original text. Regex words
+    /// are used as written, so write them against the folded text.
+    pub fn with_options(profile: &Profile, mode: MatchMode, normalize: bool) -> Result<Self, String> {
         let mut patterns = Vec::new();
         let mut reasons = Vec::new();
         let mut min_value = 0;
@@ -217,8 +269,8 @@ impl Validator {
                     }
                     if let Some(conflicts) = &reqs.conflict_items {
                         for cd in conflicts {
-                            patterns.push(cd.item_code.clone());
-                            patterns.push(cd.name.clone());
+                            patterns.push(if normalize { fold_text(&cd.item_code) } else { cd.item_code.clone() });
+                            patterns.push(if normalize { fold_text(&cd.name) } else { cd.name.clone() });
                             reasons.push(format!("{}: {}", cd.name, cd.reason));
                             reasons.push(format!("{}: {}", cd.name, cd.reason));
                         }
@@ -231,7 +283,7 @@ impl Validator {
                         .trigger_words
                         .iter()
                         .map(|w| {
-                            let matcher = Matcher::compile(w, mode)?;
+                            let matcher = Matcher::compile(w, mode, normalize)?;
                             let (lit, has_re) = match &matcher {
                                 Matcher::Literal(s) => (Some(s.as_str()), false),
                                 Matcher::Regex(_) => (None, true),
@@ -288,6 +340,7 @@ impl Validator {
 
         Ok(Validator {
             keyword_index: KeywordIndex { ac: kw_ac, set: kw_set },
+            normalize,
             value_regex,
             value_warning_template,
             conflict_items_ac,
@@ -321,14 +374,28 @@ impl Validator {
             .collect()
     }
 
-    pub fn validate(&self, text: &str) -> ValidationResult {
+    pub fn validate(&self, original: &str) -> ValidationResult {
+        // A6: with normalization on, all matching runs on the folded text and every offset is
+        // mapped back to the original before it becomes a line number.
+        let (folded, map) = if self.normalize {
+            let (t, m) = normalize_with_offsets(original);
+            (Some(t), Some(m))
+        } else {
+            (None, None)
+        };
+        let text: &str = folded.as_deref().unwrap_or(original);
+
         // Pre-compute line start offsets once, reused for all markers.
         let line_starts: Vec<usize> = std::iter::once(0)
-            .chain(text.char_indices().filter(|(_, c)| *c == '\n').map(|(i, _)| i + 1))
+            .chain(original.char_indices().filter(|(_, c)| *c == '\n').map(|(i, _)| i + 1))
             .collect();
 
-        // Map a byte offset to a 1-based line number.
+        // Map a byte offset (in the matched text) to a 1-based line number of the original.
         let offset_to_line = |offset: usize| -> u32 {
+            let offset = match &map {
+                Some(m) => m[offset.min(m.len() - 1)],
+                None => offset,
+            };
             line_starts.partition_point(|&s| s <= offset) as u32
         };
 
@@ -584,6 +651,38 @@ mod tests {
         let res = v.validate("diagnosis F20 recorded");
         assert_eq!(res.markers.len(), 1);
         assert!(res.markers[0].message.contains("broad"));
+    }
+
+    #[test]
+    fn a6_nfkc_option_maps_offsets() {
+        // Offset map: full-width letters, a half-width kana with its dakuten mark, and case.
+        let src = "Ａb\nｶﾞ";
+        let (norm, map) = normalize_with_offsets(src);
+        assert_eq!(norm, "ab\nガ");
+        assert_eq!(map.len(), norm.len() + 1);
+        assert_eq!(map[0], 0); // "a" comes from "Ａ" at byte 0
+        assert_eq!(map[1], 3); // "b" at byte 3
+        assert_eq!(map[2], 4); // newline
+        assert_eq!(map[3], 5); // "ガ" starts at the kana "ｶ"
+        assert_eq!(map[5], 5); // all three bytes of "ガ" map to the starter
+        assert_eq!(*map.last().unwrap(), src.len());
+
+        // Default stays unchanged: a full-width code does not hit; with the option it does,
+        // and the marker line is the line of the original text.
+        let profile = keyword_profile("f20");
+        let text = "intro\nsecond\nコード Ｆ２０ です";
+        let plain = Validator::with_mode(&profile, MatchMode::Literal).unwrap();
+        assert!(!plain.validate(text).has_keyword_conflict);
+        let folded = Validator::with_options(&profile, MatchMode::Literal, true).unwrap();
+        let res = folded.validate(text);
+        assert!(res.has_keyword_conflict);
+        assert_eq!(res.markers[0].line, 3);
+        // Words are folded too: an upper-case full-width trigger word matches ASCII text.
+        let wide = Validator::with_options(&keyword_profile("ＡＢＣ"), MatchMode::Literal, true).unwrap();
+        assert!(wide.validate("x\nabc").has_keyword_conflict);
+        // Pure lower-case ASCII maps one to one.
+        let (n, m) = normalize_with_offsets("abc");
+        assert_eq!((n.as_str(), m), ("abc", vec![0, 1, 2, 3]));
     }
 
     #[test]
