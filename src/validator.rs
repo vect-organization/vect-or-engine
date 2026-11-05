@@ -2,9 +2,12 @@
 // SPDX-License-Identifier: MIT
 // https://github.com/1abcdefggs/vect-or-engine
 
+#![forbid(unsafe_code)]
+
 use crate::profile::Profile;
 use aho_corasick::AhoCorasick;
-use regex::Regex;
+use crate::limits::MAX_REGEX_SIZE;
+use regex::{Regex, RegexBuilder};
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -21,8 +24,7 @@ pub struct ValidationResult {
     pub has_keyword_conflict: bool,
     pub keyword_message: Option<String>,
     pub value_message: Option<String>,
-    /// SmallVec: zero heap allocation for ≤4 markers (typical case).
-    pub markers: Vec<ValidationMarker>,
+        pub markers: Vec<ValidationMarker>,
 }
 
 /// How keyword-rule `trigger_words` are matched against the document (ADR-0006).
@@ -59,7 +61,10 @@ enum Matcher {
 impl Matcher {
     fn compile(word: &str, mode: MatchMode) -> Result<Self, String> {
         let regex = || {
-            Regex::new(word).map_err(|e| format!("invalid regex '{word}' in keyword rule: {e}"))
+            RegexBuilder::new(word)
+                .size_limit(MAX_REGEX_SIZE)
+                .build()
+                .map_err(|e| format!("invalid regex '{word}' in keyword rule: {e}"))
         };
         Ok(match mode {
             MatchMode::Literal => Matcher::Literal(word.to_string()),
@@ -105,10 +110,10 @@ pub struct Validator {
 }
 
 impl Validator {
-    /// Literal matching. Cannot fail: literal trigger words are never compiled.
-    pub fn new(profile: &Profile) -> Self {
+    /// Literal matching. Fails only on an invalid or oversized `value_regex_pattern`
+    /// (a rule is never dropped silently).
+    pub fn new(profile: &Profile) -> Result<Self, String> {
         Self::with_mode(profile, MatchMode::Literal)
-            .expect("literal keyword matching never fails to compile")
     }
 
     /// Builds the validator with the given keyword matching mode. Fails on an invalid regex,
@@ -128,9 +133,12 @@ impl Validator {
                         min_value = min_v;
                     }
                     if let Some(pattern) = &reqs.value_regex_pattern {
-                        if let Ok(re) = Regex::new(pattern) {
-                            value_regex = Some(re);
-                        }
+                        value_regex = Some(
+                            RegexBuilder::new(pattern)
+                                .size_limit(MAX_REGEX_SIZE)
+                                .build()
+                                .map_err(|e| format!("invalid value_regex_pattern '{pattern}': {e}"))?,
+                        );
                     }
                     if let Some(warning_template) = &reqs.value_warning_template {
                         value_warning_template = Some(warning_template.clone());
@@ -301,7 +309,7 @@ mod tests {
         }"#;
 
         let profile = Profile::load_from_json_str(json_data).unwrap();
-        let validator = Validator::new(&profile);
+        let validator = Validator::new(&profile).unwrap();
 
         // Test numerical warning
         let res1 = validator.validate("The proposed Budget: 40K is ready.");

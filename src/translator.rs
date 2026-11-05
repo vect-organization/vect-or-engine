@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 // https://github.com/1abcdefggs/vect-or-engine
 
+#![forbid(unsafe_code)]
+
 use crate::profile::Profile;
 use aho_corasick::AhoCorasick;
 use serde::{Deserialize, Serialize};

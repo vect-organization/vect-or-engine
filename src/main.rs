@@ -5,7 +5,7 @@
 //! vect-or-engine -- stdin/stdout JSON-RPC server (Phase 1+3).
 //!
 //! Phase 1: tokio async runtime, mpsc-serialised stdout, Arc<tokio::sync::RwLock>.
-//! Phase 3: KnowledgeStore (memmap2+f16+HNSW), build_index, SQLite cache.
+//! Phase 3: KnowledgeStore (f16 + HNSW), build_index, SQLite cache.
 
 use std::sync::Arc;
 use serde::{Deserialize, Serialize};
@@ -48,7 +48,7 @@ struct EngineState {
 
 impl EngineState {
     fn new(profile: Profile) -> Self {
-        let validator = Validator::new(&profile);
+        let validator = Validator::new(&profile).expect("the default profile has no value regex");
         let translator = Translator::new(&profile);
         EngineState { profile, validator, translator, knowledge_store: KnowledgeStore::new() }
     }
@@ -103,6 +103,12 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
                 return RpcResponse::from_engine_err(e, req.id);
             }
 
+            let too_big = std::fs::metadata(&path)
+                .map(|m| m.len() > vect_or_engine::limits::MAX_PROFILE_BYTES as u64)
+                .unwrap_or(false);
+            if too_big {
+                return RpcResponse::err(format!("Profile '{path}' is larger than the {} byte limit", vect_or_engine::limits::MAX_PROFILE_BYTES), req.id);
+            }
             match std::fs::read_to_string(&path) {
                 Err(e) => RpcResponse::err(format!("Cannot read '{path}': {e}"), req.id),
                 Ok(content) => match Profile::load_any_json_str(&content) {
@@ -110,14 +116,17 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
                     Ok(profile) if profile.is_empty() => {
                         RpcResponse::err(Profile::EMPTY_MESSAGE.to_string(), req.id)
                     }
-                    Ok(profile) => {
-                        // Swap rules only; keep the loaded KB / index (was reset by EngineState::new).
-                        let mut s = state.write().await;
-                        s.validator = Validator::new(&profile);
-                        s.translator = Translator::new(&profile);
-                        s.profile = profile;
-                        RpcResponse::ok(serde_json::json!({"loaded":true,"path":path}), req.id)
-                    }
+                    Ok(profile) => match Validator::new(&profile) {
+                        Err(e) => RpcResponse::err(e, req.id),
+                        Ok(validator) => {
+                            // Swap rules only; keep the loaded KB / index (was reset by EngineState::new).
+                            let mut s = state.write().await;
+                            s.validator = validator;
+                            s.translator = Translator::new(&profile);
+                            s.profile = profile;
+                            RpcResponse::ok(serde_json::json!({"loaded":true,"path":path}), req.id)
+                        }
+                    },
                 },
             }
         }
@@ -211,6 +220,9 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
             };
             let query: Vec<f32> = vec_arr.iter()
                 .filter_map(|v| v.as_f64().map(|f| f as f32)).collect();
+            if let Err(e) = KnowledgeStore::check_finite_query(&query) {
+                return RpcResponse::from_engine_err(e, req.id);
+            }
             let s = state.read().await;
             if s.knowledge_store.is_empty() {
                 return RpcResponse::err("Knowledge base empty. Call load_knowledge_base first.", req.id);

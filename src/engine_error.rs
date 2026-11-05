@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 // https://github.com/1abcdefggs/vect-or-engine
 
+#![forbid(unsafe_code)]
+
 //! Centralized error types for vect-or-engine.
 //! All error variants are typed, allowing callers to branch on specific failures.
 
@@ -30,6 +32,9 @@ pub enum EngineError {
 
     #[error("Invalid path provided: {0}")]
     InvalidPath(String),
+
+    #[error("Invalid input: {0}")]
+    InvalidInput(String),
 
     // ── Search ─────────────────────────────────────────────────────────────
     #[error("HNSW index not built. Call 'build_index' first.")]

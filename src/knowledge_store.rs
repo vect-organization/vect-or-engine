@@ -2,21 +2,23 @@
 // SPDX-License-Identifier: MIT
 // https://github.com/1abcdefggs/vect-or-engine
 
+#![forbid(unsafe_code)]
+
 //! Knowledge base storage — Phase 3.
 //!
 //! Optimisations layered in this module:
-//!  1. **memmap2**        — zero-copy memory-mapped I/O for JSON loading.
+//!  1. **fs::read**       — the JSON file is read once and parsed (no unsafe, no mmap).
 //!  2. **f16 quantisation** — vectors stored as 16-bit floats (50 % memory).
 //!  3. **rayon**          — parallel linear scan for mid-size datasets.
 //!  4. **HnswIndex**      — O(log N) approximate search for large datasets.
 //!  5. **SQLite cache**   — avoids re-parsing JSON on every restart.
 
 use half::f16;
-use memmap2::MmapOptions;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
-use std::cmp::Ordering;
 use std::fs;
+
+use crate::limits::{F16_MAX_ABS, MAX_KB_BYTES, MAX_TOP_K};
 
 use crate::engine_error::EngineError;
 use crate::hnsw_index::HnswIndex;
@@ -131,16 +133,21 @@ impl KnowledgeStore {
 
     // ── Loading ───────────────────────────────────────────────────────────────
 
-    /// Load knowledge base from a JSON file using zero-copy memory-mapped I/O.
+    /// Load knowledge base from a JSON file.
     ///
-    /// The file is parsed once; vectors are quantised to f16 on the fly.
-    /// Returns the number of items loaded.
+    /// The file is read and parsed once; vectors are quantised to f16 on the fly.
+    /// Files larger than `MAX_KB_BYTES`, zero-length vectors and non-finite or
+    /// f16-overflowing components are rejected. Returns the number of items loaded.
     pub fn load_from_path(&mut self, path: &str) -> Result<usize, EngineError> {
-        let file = fs::File::open(path)?;
-        // SAFETY: we do not mutate the file while the mmap lives.
-        let mmap = unsafe { MmapOptions::new().map(&file)? };
+        let size = fs::metadata(path)?.len();
+        if size > MAX_KB_BYTES {
+            return Err(EngineError::InvalidInput(format!(
+                "knowledge base file is {size} bytes, larger than the {MAX_KB_BYTES} byte limit"
+            )));
+        }
+        let bytes = fs::read(path)?;
 
-        let raw: Vec<KnowledgeItem> = serde_json::from_slice(&mmap)?;
+        let raw: Vec<KnowledgeItem> = serde_json::from_slice(&bytes)?;
         let count = raw.len();
 
         if count == 0 {
@@ -148,8 +155,21 @@ impl KnowledgeStore {
         }
 
         let new_dim = raw[0].vector.len();
+        if new_dim == 0 {
+            return Err(EngineError::InvalidInput("the first item has an empty vector (dimension 0)".into()));
+        }
+        for (i, item) in raw.iter().enumerate() {
+            if item.vector.len() != new_dim {
+                return Err(EngineError::DimensionMismatch { expected: new_dim, got: item.vector.len() });
+            }
+            if let Some(x) = item.vector.iter().find(|x| !x.is_finite() || x.abs() > F16_MAX_ABS) {
+                return Err(EngineError::InvalidInput(format!(
+                    "item #{i} has a vector component {x} that is not finite or exceeds {F16_MAX_ABS}"
+                )));
+            }
+        }
 
-        // Reset state.
+        // Reset state (only reached when every item passed the checks above).
         self.dim = new_dim;
         self.hnsw = None;
         self.items = Vec::with_capacity(count);
@@ -176,6 +196,14 @@ impl KnowledgeStore {
         Ok(count)
     }
 
+    /// Rejects a query that contains NaN or an infinity (change-log D4).
+    pub fn check_finite_query(query: &[f32]) -> Result<(), EngineError> {
+        match query.iter().position(|x| !x.is_finite()) {
+            Some(i) => Err(EngineError::InvalidInput(format!("query component #{i} is not finite"))),
+            None => Ok(()),
+        }
+    }
+
     // ── Index building ────────────────────────────────────────────────────────
 
     /// Build (or rebuild) the HNSW approximate-nearest-neighbour index.
@@ -198,13 +226,19 @@ impl KnowledgeStore {
     ///
     /// Handles vector similarity, result capping, and score thresholding.
     pub fn search_query(&self, query: &SearchQuery) -> Vec<SearchResult> {
+        // A non-finite query would give NaN scores; callers should reject it with
+        // `check_finite_query`, and the store returns nothing rather than a bogus ranking.
+        if Self::check_finite_query(query.vector).is_err() {
+            return Vec::new();
+        }
+        let top_k = query.top_k.min(MAX_TOP_K);
         let results = if let Some(hnsw) = &self.hnsw {
-            let raw = hnsw.search(query.vector, query.top_k);
+            let raw = hnsw.search(query.vector, top_k);
             raw.into_iter()
                 .map(|(score, idx)| self.make_result(score, idx))
                 .collect::<Vec<_>>()
         } else {
-            self.linear_search(query.vector, query.top_k)
+            self.linear_search(query.vector, top_k)
         };
 
         if let Some(min_score) = query.min_similarity {
@@ -221,7 +255,7 @@ impl KnowledgeStore {
         self.search_query(&SearchQuery::new(query).with_top_k(top_k))
     }
 
-    /// Parallel rayon linear scan — O(N) with SIMD dot product.
+    /// Parallel rayon linear scan — O(N); the f16 dot product is safe code the compiler can vectorise.
     ///
     /// Suitable for ≤ ~10 K items or when HNSW is not yet built.
     pub fn linear_search(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
@@ -238,12 +272,10 @@ impl KnowledgeStore {
         // O(N) partial selection — avoids full sort.
         let n = scores.len();
         if n > top_k {
-            scores.select_nth_unstable_by(top_k, |a, b| {
-                b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal)
-            });
+            scores.select_nth_unstable_by(top_k, |a, b| b.0.total_cmp(&a.0));
             scores.truncate(top_k);
         }
-        scores.sort_unstable_by(|a, b| b.0.partial_cmp(&a.0).unwrap_or(Ordering::Equal));
+        scores.sort_unstable_by(|a, b| b.0.total_cmp(&a.0));
 
         scores
             .into_iter()
@@ -289,8 +321,12 @@ impl KnowledgeStore {
 
     /// Load knowledge base from a SQLite cache (fast restart path).
     pub fn load_from_sqlite(&mut self, db_path: &str) -> Result<usize, EngineError> {
-        let conn = rusqlite::Connection::open(db_path)
-            .map_err(|e| EngineError::Database(e.to_string()))?;
+        // Read-only and never create: opening a missing path must not leave a new file behind.
+        let conn = rusqlite::Connection::open_with_flags(
+            db_path,
+            rusqlite::OpenFlags::SQLITE_OPEN_READ_ONLY | rusqlite::OpenFlags::SQLITE_OPEN_URI,
+        )
+        .map_err(|e| EngineError::Database(e.to_string()))?;
 
         let mut stmt = conn.prepare(
             "SELECT id, metadata, vector_f16 FROM kb_items ORDER BY idx"
@@ -363,40 +399,23 @@ impl SearchResult {
 
 // ─── SIMD-friendly f16 dot product ───────────────────────────────────────────
 
-/// Compute dot product between an f32 query and an f16-stored vector.
-/// 8-way unroll so the compiler can issue 256-bit SIMD loads.
+/// Dot product between an f32 query and an f16-stored vector. Safe code only: fixed
+/// 8-wide chunks give the compiler bounds-check-free loops it can vectorise.
 #[inline(always)]
 fn dot_product_f16(query: &[f32], stored: &[f16]) -> f32 {
     let n = query.len().min(stored.len());
-    let mut s0 = 0.0f32;
-    let mut s1 = 0.0f32;
-    let mut s2 = 0.0f32;
-    let mut s3 = 0.0f32;
-    let mut s4 = 0.0f32;
-    let mut s5 = 0.0f32;
-    let mut s6 = 0.0f32;
-    let mut s7 = 0.0f32;
-
-    let chunks = n / 8;
-    for i in 0..chunks {
-        let b = i * 8;
-        unsafe {
-            s0 += query.get_unchecked(b)     * f32::from(*stored.get_unchecked(b));
-            s1 += query.get_unchecked(b + 1) * f32::from(*stored.get_unchecked(b + 1));
-            s2 += query.get_unchecked(b + 2) * f32::from(*stored.get_unchecked(b + 2));
-            s3 += query.get_unchecked(b + 3) * f32::from(*stored.get_unchecked(b + 3));
-            s4 += query.get_unchecked(b + 4) * f32::from(*stored.get_unchecked(b + 4));
-            s5 += query.get_unchecked(b + 5) * f32::from(*stored.get_unchecked(b + 5));
-            s6 += query.get_unchecked(b + 6) * f32::from(*stored.get_unchecked(b + 6));
-            s7 += query.get_unchecked(b + 7) * f32::from(*stored.get_unchecked(b + 7));
+    let (query, stored) = (&query[..n], &stored[..n]);
+    let mut acc = [0.0f32; 8];
+    let mut q_chunks = query.chunks_exact(8);
+    let mut s_chunks = stored.chunks_exact(8);
+    for (q, s) in (&mut q_chunks).zip(&mut s_chunks) {
+        for k in 0..8 {
+            acc[k] += q[k] * f32::from(s[k]);
         }
     }
-
-    let mut sum = s0 + s1 + s2 + s3 + s4 + s5 + s6 + s7;
-    for i in (chunks * 8)..n {
-        unsafe {
-            sum += query.get_unchecked(i) * f32::from(*stored.get_unchecked(i));
-        }
+    let mut sum = acc.iter().sum::<f32>();
+    for (q, s) in q_chunks.remainder().iter().zip(s_chunks.remainder()) {
+        sum += q * f32::from(*s);
     }
     sum
 }
@@ -421,6 +440,66 @@ mod tests {
             });
         }
         store
+    }
+
+    fn write_kb(json: &str) -> String {
+        let path = std::env::temp_dir().join(format!("vect-ks-{}-{}.json", std::process::id(), json.len()));
+        std::fs::write(&path, json).unwrap();
+        path.to_string_lossy().into_owned()
+    }
+
+    #[test]
+    fn d8_zero_dim_rejected() {
+        let mut store = KnowledgeStore::new();
+        let p = write_kb(r#"[{"id":"a","vector":[]}]"#);
+        assert!(store.load_from_path(&p).is_err());
+        assert_eq!(store.dim, 0);
+        std::fs::remove_file(p).ok();
+    }
+
+    #[test]
+    fn d4_non_finite_rejected() {
+        let mut store = KnowledgeStore::new();
+        // 70000 overflows f16 (max 65504) and would become infinity.
+        let p = write_kb(r#"[{"id":"a","vector":[70000.0,0.0]}]"#);
+        let e = store.load_from_path(&p).unwrap_err().to_string();
+        assert!(e.contains("65504"), "{e}");
+        std::fs::remove_file(p).ok();
+        assert!(KnowledgeStore::check_finite_query(&[1.0, f32::NAN]).is_err());
+        assert!(KnowledgeStore::check_finite_query(&[1.0, f32::INFINITY]).is_err());
+        assert!(KnowledgeStore::check_finite_query(&[1.0, -2.0]).is_ok());
+        let store = make_store(5, 4);
+        assert!(store.search(&[f32::NAN, 0.0, 0.0, 0.0], 3).is_empty());
+    }
+
+    #[test]
+    fn a_rejected_load_keeps_the_previous_kb() {
+        let mut store = KnowledgeStore::new();
+        let ok = write_kb(r#"[{"id":"a","vector":[1.0,0.0]},{"id":"b","vector":[0.0,1.0]}]"#);
+        assert_eq!(store.load_from_path(&ok).unwrap(), 2);
+        let bad = write_kb(r#"[{"id":"c","vector":[1.0,0.0]},{"id":"d","vector":[1.0]}]"#);
+        assert!(store.load_from_path(&bad).is_err());
+        assert_eq!(store.len(), 2, "validation happens before the old KB is dropped");
+        std::fs::remove_file(ok).ok();
+        std::fs::remove_file(bad).ok();
+    }
+
+    #[test]
+    fn s4_top_k_is_capped_and_sqlite_open_does_not_create_files() {
+        let store = make_store(5, 4);
+        assert_eq!(store.search(&[1.0, 0.0, 0.0, 0.0], usize::MAX).len(), 5);
+        let missing = std::env::temp_dir().join(format!("vect-missing-{}.db", std::process::id()));
+        let mut s = KnowledgeStore::new();
+        assert!(s.load_from_sqlite(&missing.to_string_lossy()).is_err());
+        assert!(!missing.exists());
+    }
+
+    #[test]
+    fn safe_dot_matches_a_plain_sum() {
+        let q: Vec<f32> = (0..21).map(|i| i as f32 * 0.5).collect();
+        let s: Vec<f16> = (0..21).map(|i| f16::from_f32(1.0 + i as f32)).collect();
+        let want: f32 = q.iter().zip(&s).map(|(a, b)| a * f32::from(*b)).sum();
+        assert!((dot_product_f16(&q, &s) - want).abs() < 1e-3);
     }
 
     #[test]

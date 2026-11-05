@@ -27,6 +27,27 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ---
 
+## [0.3.8] - 2026-11-06
+
+Phase A of the 0.4.0 work (guard rails). Change-log rows: `docs/changes/v0.4.0.csv`.
+
+### Changed
+- `Validator::new` now returns `Result` (an invalid `value_regex_pattern` is an error, not a silently skipped check). Rust API only
+- A profile is checked at load: empty patterns, patterns over 4096 bytes, more than 10,000 rules or 100,000 patterns, and regexes over the 1 MiB size limit are rejected, and the error names the rule
+- Guideline `severity` is case-insensitive; an unknown value is an error
+- A knowledge base with a zero-length vector, a non-finite component or a component beyond f16 range (65504) is rejected before the previous KB is touched; a rejected load keeps the previous KB
+- A query with NaN or an infinity is rejected (`search` in N-API and the CLI); `top_k` is capped at 1000; score ordering uses `total_cmp`
+- The SQLite cache is opened read-only for loading, so a wrong path no longer leaves a new empty file
+
+### Security
+- All `unsafe` code is gone: the dot products are safe 8-lane loops and the knowledge base is read with `fs::read` instead of `mmap`. The six core modules carry `#![forbid(unsafe_code)]`
+- Removed the unused dependencies `anyhow` and `memmap2`, and the unused `serde` feature of `half`
+- Removed `once_cell` (replaced by `std::sync::LazyLock`); `tokio` is now optional and a new default feature `cli` enables the CLI's extra tokio features, so `--no-default-features` builds the core without tokio. tokio is 1.54.1 or later
+- A profile file over 16 MiB is rejected before it is read (CLI and N-API); a knowledge-base file over 1 GiB is rejected
+- README and comments no longer describe `memmap2`, the 4-way unrolled loop or `unsafe` blocks that were removed; `tests/repo_hygiene.rs` guards this and the dependency list
+
+---
+
 ## [0.3.7] - 2026-11-04
 
 Not tagged or released. `main` carries this version number together with the Unreleased items above; the next release is planned as 0.4.0.

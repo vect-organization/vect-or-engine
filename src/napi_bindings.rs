@@ -3,7 +3,7 @@
 use napi_derive::napi;
 use crate::*;
 use napi::bindgen_prelude::*;
-use once_cell::sync::Lazy;
+use std::sync::LazyLock;
 use std::sync::Arc;
 use tokio::sync::RwLock;
 
@@ -20,7 +20,7 @@ struct Engine {
 
 impl Engine {
     fn new(profile: Profile) -> Self {
-        let validator = Validator::new(&profile);
+        let validator = Validator::new(&profile).expect("the default profile has no value regex");
         let translator = Translator::new(&profile);
         Self {
             profile,
@@ -31,8 +31,8 @@ impl Engine {
     }
 }
 
-static ENGINE: Lazy<Arc<RwLock<Engine>>> =
-    Lazy::new(|| Arc::new(RwLock::new(Engine::new(Profile::default()))));
+static ENGINE: LazyLock<Arc<RwLock<Engine>>> =
+    LazyLock::new(|| Arc::new(RwLock::new(Engine::new(Profile::default()))));
 /// A simple ping function to verify the NAPI setup.
 #[napi]
 pub fn ping(name: String) -> String {
@@ -160,6 +160,15 @@ pub async fn load_profile(path: String, match_mode: Option<String>) -> Result<()
             )
         })?,
     };
+    let size = std::fs::metadata(&path)
+        .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to read profile: {e}")))?
+        .len();
+    if size > crate::limits::MAX_PROFILE_BYTES as u64 {
+        return Err(Error::new(
+            Status::InvalidArg,
+            format!("Profile is {size} bytes, larger than the {} byte limit", crate::limits::MAX_PROFILE_BYTES),
+        ));
+    }
     let content = std::fs::read_to_string(&path)
         .map_err(|e| Error::new(Status::GenericFailure, format!("Failed to read profile: {e}")))?;
     let profile = Profile::load_any_json_str(&content)
@@ -171,12 +180,13 @@ pub async fn load_profile(path: String, match_mode: Option<String>) -> Result<()
     // so a bad profile leaves the previously loaded rules in place.
     let validator = Validator::with_mode(&profile, mode)
         .map_err(|e| Error::new(Status::InvalidArg, e))?;
+    let translator = Translator::new(&profile);
 
     // Swap rules only. Replacing the whole Engine (previous behaviour) also reset
     // knowledge_store, silently discarding a loaded KB and its HNSW index.
     let mut engine = ENGINE.write().await;
     engine.validator = validator;
-    engine.translator = Translator::new(&profile);
+    engine.translator = translator;
     engine.profile = profile;
     Ok(())
 }
@@ -244,11 +254,18 @@ fn ensure_query_dim(expected: usize, got: usize) -> Result<()> {
     Ok(())
 }
 
+/// Change-log D4: a NaN or infinite component would give NaN scores, so reject it.
+fn ensure_finite_query(query: &[f32]) -> Result<()> {
+    KnowledgeStore::check_finite_query(query)
+        .map_err(|e| Error::new(Status::InvalidArg, e.to_string()))
+}
+
 #[napi]
 pub async fn search(query: Float32Array, top_k: u32) -> Result<Vec<JsSearchResult>> {
     let engine = ENGINE.read().await;
     // The caller (vect-or-edit) falls back to Module 0 (P.scan dictionary matching) on this error.
     ensure_query_dim(engine.knowledge_store.dim, query.len())?;
+    ensure_finite_query(&query)?;
     // Pass query by reference to avoid allocation.
     let results = engine.knowledge_store.search(&query, top_k as usize);
     Ok(results.iter().map(Into::into).collect())

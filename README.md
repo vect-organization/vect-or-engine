@@ -26,8 +26,8 @@ A knowledge base is a list of entries with 384-dimensional vectors (the dimensio
 
 How the core stores and scans vectors:
 
-- Knowledge files are read through `memmap2` memory-mapped I/O, without copying them into a buffer first
-- The dot product is a 4-way unrolled loop that the compiler auto-vectorizes (SIMD)
+- Knowledge files are read once with `fs::read` and parsed (no memory mapping, no `unsafe`); files over 1 GiB are rejected
+- The dot product is safe Rust with 8 independent accumulators over fixed-size chunks; the compiler vectorises it at the build target's baseline (SSE2 unless `target-cpu` is raised)
 - Without an index, or for mid-size data, a parallel linear scan with `rayon` is used
 - The Rust API also has a `SearchQuery` bundle (top-k, minimum similarity threshold, slot routing); the N-API `search` takes only the vector and `topK`
 
@@ -338,7 +338,7 @@ vect-or-engine/
     ├── napi_bindings.rs # N-API bindings & Node.js native interface (only with --features napi)
     ├── main.rs         # Headless CLI binary (vect_or_engine_cli), core engine only
     ├── hnsw_index.rs   # HNSW graph indexing & search implementation
-    ├── knowledge_store.rs # Vector quantization (f16), mmap, and SQLite store
+    ├── knowledge_store.rs # Vector quantization (f16) and SQLite store
     ├── validator.rs    # Real-time static linter & rule evaluator
     ├── translator.rs   # Term mapping & colloquial pattern matching
     ├── profile.rs      # Schema-driven profile deserializer
@@ -356,7 +356,7 @@ No runtime npm dependencies; `npm audit` reports 0 vulnerabilities. GitHub Depen
 ### SQL and `unsafe` Code
 
 - **SQL**: the SQLite cache (`knowledge_store.rs`) uses prepared statements with bound parameters (`rusqlite::params!`); no SQL is built from strings
-- **`unsafe` code**: 5 blocks. 2 in `hnsw_index.rs` (`get_unchecked` in the 4-way unrolled dot product and its tail) and 3 in `knowledge_store.rs` (one mmap, two `get_unchecked` loops). Memory safety outside these blocks is checked at compile time
+- **`unsafe` code**: none in the core modules (each has `#![forbid(unsafe_code)]`, since 0.3.8). Memory safety is checked at compile time
 
 ### MCP Server Exposure
 

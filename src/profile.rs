@@ -2,6 +2,8 @@
 // SPDX-License-Identifier: MIT
 // https://github.com/1abcdefggs/vect-or-engine
 
+#![forbid(unsafe_code)]
+
 use serde::{Deserialize, Serialize};
 use std::collections::HashMap;
 
@@ -82,15 +84,86 @@ impl Profile {
     /// `from_guideline_json_str`; anything else is parsed as a native Profile. Without this,
     /// guideline files deserialize into an all-None Profile with no error and no rule fires.
     pub fn load_any_json_str(json_str: &str) -> Result<Self, serde_json::Error> {
+        use serde::de::Error as _;
+        if json_str.len() > crate::limits::MAX_PROFILE_BYTES {
+            return Err(serde_json::Error::custom(format!(
+                "profile is larger than {} bytes",
+                crate::limits::MAX_PROFILE_BYTES
+            )));
+        }
         let value: serde_json::Value = serde_json::from_str(json_str)?;
         let is_guideline = value.get("rules").is_some_and(|r| r.is_array())
             && value.get("domain").is_some();
-        if is_guideline {
-            if let Ok(p) = Self::from_guideline_json_str(json_str) {
-                return Ok(p);
+        let profile = if is_guideline {
+            // A guideline that fails to convert is an error, not a silent fall-back to an
+            // empty native profile.
+            Self::from_guideline_json_str(json_str)?
+        } else {
+            serde_json::from_value(value)?
+        };
+        profile.validate().map_err(serde_json::Error::custom)?;
+        Ok(profile)
+    }
+
+    /// Checks a loaded profile before any matcher is built (change-log D3, D7, S4):
+    /// no empty or oversized patterns, a bounded number of rules, and a value regex that
+    /// compiles within the size limit. Errors name the offending rule.
+    pub fn validate(&self) -> Result<(), String> {
+        use crate::limits::{MAX_PATTERNS, MAX_PATTERN_BYTES, MAX_REGEX_SIZE, MAX_RULES};
+        let mut patterns = 0usize;
+        let mut rules = 0usize;
+        let mut check = |what: &str, text: &str| -> Result<(), String> {
+            if text.is_empty() {
+                return Err(format!("empty pattern in {what}"));
+            }
+            if text.len() > MAX_PATTERN_BYTES {
+                return Err(format!("pattern in {what} is longer than {MAX_PATTERN_BYTES} bytes"));
+            }
+            patterns += 1;
+            if patterns > MAX_PATTERNS {
+                return Err(format!("more than {MAX_PATTERNS} patterns in the profile"));
+            }
+            Ok(())
+        };
+
+        if let Some(a) = &self.assessment_rules {
+            for (i, rule) in a.keyword_rules.iter().flatten().enumerate() {
+                rules += 1;
+                if rule.trigger_words.is_empty() {
+                    return Err(format!("keyword rule #{i} has no trigger words"));
+                }
+                for w in &rule.trigger_words {
+                    check(&format!("keyword rule #{i} ('{}')", rule.warning_message), w)?;
+                }
+            }
+            if let Some(req) = a.document_template.as_ref().and_then(|t| t.numerical_requirements.as_ref()) {
+                for (i, c) in req.conflict_items.iter().flatten().enumerate() {
+                    check(&format!("conflict item #{i} item_code"), &c.item_code)?;
+                    check(&format!("conflict item #{i} ('{}') name", c.item_code), &c.name)?;
+                }
+                if let Some(pat) = &req.value_regex_pattern {
+                    if pat.len() > MAX_PATTERN_BYTES {
+                        return Err(format!("value_regex_pattern is longer than {MAX_PATTERN_BYTES} bytes"));
+                    }
+                    regex::RegexBuilder::new(pat)
+                        .size_limit(MAX_REGEX_SIZE)
+                        .build()
+                        .map_err(|e| format!("invalid value_regex_pattern '{pat}': {e}"))?;
+                }
             }
         }
-        serde_json::from_value(value)
+        if let Some(c) = &self.conversational_translation_rules {
+            for rule in &c.rules {
+                rules += 1;
+                for p in &rule.colloquial_patterns {
+                    check(&format!("conversational rule '{}'", rule.item_id), p)?;
+                }
+            }
+        }
+        if rules > MAX_RULES {
+            return Err(format!("more than {MAX_RULES} rules in the profile"));
+        }
+        Ok(())
     }
 
     /// True when no section carries any rule (used to surface silent no-op profiles).
@@ -126,7 +199,16 @@ impl Profile {
         let mut conversational_rules = Vec::new();
 
         for rule in raw.rules {
-            match rule.severity.as_str() {
+            use serde::de::Error as _;
+            // Severity is case-insensitive; an unknown value is rejected, not guessed.
+            let severity = rule.severity.trim().to_ascii_lowercase();
+            if !matches!(severity.as_str(), "error" | "warning" | "info" | "hint") {
+                return Err(serde_json::Error::custom(format!(
+                    "rule '{}' has unknown severity '{}' (expected error, warning, info or hint)",
+                    rule.id, rule.severity
+                )));
+            }
+            match severity.as_str() {
                 // severity: error -> G.rule (strict enforcement)
                 "error" => {
                     keyword_rules.push(KeywordRule {
@@ -232,6 +314,46 @@ mod tests {
         let native = r#"{"assessment_rules":{"keyword_rules":[{"trigger_words":["x"],"warning_message":"m"}]}}"#;
         let p = Profile::load_any_json_str(native).unwrap();
         assert!(!p.is_empty());
+    }
+
+    fn load_err(json: &str) -> String {
+        Profile::load_any_json_str(json).expect_err("must be rejected").to_string()
+    }
+
+    #[test]
+    fn d3_empty_pattern_rejected() {
+        let e = load_err(r#"{"assessment_rules":{"keyword_rules":[{"trigger_words":[""],"warning_message":"m"}]}}"#);
+        assert!(e.contains("empty pattern") && e.contains("keyword rule #0"), "{e}");
+        let e = load_err(r#"{"assessment_rules":{"document_template":{"numerical_requirements":{"conflict_items":[{"item_code":"F20","name":"","reason":"r"}]}}}}"#);
+        assert!(e.contains("empty pattern") && e.contains("F20"), "{e}");
+        let e = load_err(r#"{"conversational_translation_rules":{"rules":[{"item_id":"X1","item_name":"n","colloquial_patterns":[""],"templates":{}}]}}"#);
+        assert!(e.contains("empty pattern") && e.contains("X1"), "{e}");
+    }
+
+    #[test]
+    fn d6_severity_is_case_insensitive_and_unknown_is_rejected() {
+        let g = |sev: &str| format!(
+            r#"{{"domain":"d","version":"1","rules":[{{"id":"R1","pattern":"BAD","message":"m","severity":"{sev}"}}]}}"#
+        );
+        let p = Profile::load_any_json_str(&g("Error")).unwrap();
+        assert_eq!(p.assessment_rules.unwrap().keyword_rules.unwrap().len(), 1);
+        let e = load_err(&g("fatal"));
+        assert!(e.contains("unknown severity") && e.contains("R1"), "{e}");
+    }
+
+    #[test]
+    fn d7_invalid_value_regex_rejected() {
+        let e = load_err(r#"{"assessment_rules":{"document_template":{"numerical_requirements":{"value_regex_pattern":"(unclosed"}}}}"#);
+        assert!(e.contains("value_regex_pattern"), "{e}");
+    }
+
+    #[test]
+    fn s4_limits_enforced() {
+        let long = "a".repeat(crate::limits::MAX_PATTERN_BYTES + 1);
+        let e = load_err(&format!(r#"{{"assessment_rules":{{"keyword_rules":[{{"trigger_words":["{long}"],"warning_message":"m"}}]}}}}"#));
+        assert!(e.contains("longer than"), "{e}");
+        let e = load_err(&format!(r#"{{"assessment_rules":{{"document_template":{{"numerical_requirements":{{"value_regex_pattern":"a{{1000}}{{1000}}{{1000}}"}}}}}}}}"#));
+        assert!(e.contains("value_regex_pattern"), "{e}");
     }
 
     #[test]
