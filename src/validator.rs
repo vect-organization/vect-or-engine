@@ -245,7 +245,7 @@ impl Validator {
                 // Find the line of the first trigger word.
                 let line = rule.matchers.first()
                     .and_then(|m| m.find(text))
-                    .map(|o| offset_to_line(o))
+                    .map(&offset_to_line)
                     .unwrap_or(1);
                 markers.push(ValidationMarker {
                     severity: "Error".to_string(),
