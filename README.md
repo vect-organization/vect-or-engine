@@ -125,8 +125,8 @@ All state (profile, knowledge base, index) lives in one engine instance per proc
 | `saveKbCache(path: string)` | `Promise<void>` | Write the loaded vectors to SQLite |
 | `loadKbCache(path: string)` | `Promise<number>` (entries) | Read vectors from the SQLite cache |
 | `buildIndex()` | `Promise<number>` (indexed) | Build the HNSW graph |
-| `search(query: Float32Array, topK: number)` | `Promise<{ idx, score, id?, metadata }[]>` | Nearest entries; the query length must match the stored dimension |
-| `kbInfo()` | `Promise<{ count, dim, hnswReady }>` | State of the knowledge base |
+| `search(query: Float32Array, topK: number, ef?: number)` | `Promise<{ idx, score, id?, metadata }[]>` | Nearest entries by cosine similarity (vectors and query are normalised to unit length); the query length must match the stored dimension; `ef` is the optional HNSW width, default `max(64, 2 * topK)` |
+| `kbInfo()` | `Promise<{ count, dim, hnswReady, maxNormDeviation, rescaledCount }>` | State of the knowledge base |
 
 Paths must not be empty or contain NUL characters.
 

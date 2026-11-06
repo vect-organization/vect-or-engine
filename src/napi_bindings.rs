@@ -105,6 +105,12 @@ pub struct JsKbInfo {
     pub dim: u32,
     #[napi(js_name = "hnswReady")]
     pub hnsw_ready: bool,
+    /// Largest `| ||v|| - 1 |` over the loaded vectors, measured before they were normalised (A1).
+    #[napi(js_name = "maxNormDeviation")]
+    pub max_norm_deviation: f64,
+    /// Number of vectors that were rescaled to unit length at load (A1).
+    #[napi(js_name = "rescaledCount")]
+    pub rescaled_count: u32,
 }
 
 // --- Conversion Implementations ---
@@ -266,23 +272,30 @@ fn ensure_finite_query(query: &[f32]) -> Result<()> {
 }
 
 #[napi]
-pub async fn search(query: Float32Array, top_k: u32) -> Result<Vec<JsSearchResult>> {
+pub async fn search(query: Float32Array, top_k: u32, ef: Option<u32>) -> Result<Vec<JsSearchResult>> {
     let engine = ENGINE.read().await;
     // The caller (vect-or-edit) falls back to Module 0 (P.scan dictionary matching) on this error.
     ensure_query_dim(engine.knowledge_store.dim(), query.len())?;
     ensure_finite_query(&query)?;
     // Pass query by reference to avoid allocation.
-    let results = engine.knowledge_store.search(&query, top_k as usize);
+    let mut q = SearchQuery::new(&query).with_top_k(top_k as usize);
+    if let Some(ef) = ef {
+        q = q.with_ef(ef as usize);
+    }
+    let results = engine.knowledge_store.search_query(&q);
     Ok(results.iter().map(Into::into).collect())
 }
 
 #[napi]
 pub async fn kb_info() -> Result<JsKbInfo> {
     let engine = ENGINE.read().await;
+    let norm = engine.knowledge_store.norm_report();
     Ok(JsKbInfo {
         count: engine.knowledge_store.len() as u32,
         dim: engine.knowledge_store.dim() as u32,
         hnsw_ready: engine.knowledge_store.has_index(),
+        max_norm_deviation: norm.max_deviation,
+        rescaled_count: norm.rescaled as u32,
     })
 }
 

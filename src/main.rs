@@ -12,7 +12,7 @@ use serde::{Deserialize, Serialize};
 use serde_json::Value;
 use tokio::io::{AsyncBufReadExt, AsyncWriteExt, BufReader, BufWriter};
 use tokio::sync::{mpsc, RwLock};
-use vect_or_engine::{EngineError, KnowledgeStore, Profile, Translator, Validator};
+use vect_or_engine::{EngineError, KnowledgeStore, Profile, SearchQuery, Translator, Validator};
 
 // RPC types
 #[derive(Deserialize, Debug)]
@@ -242,7 +242,11 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
                     req.id,
                 );
             }
-            let results = s.knowledge_store.search(&query, top_k);
+            let mut sq = SearchQuery::new(&query).with_top_k(top_k);
+            if let Some(ef) = req.params.as_ref().and_then(|p| p.get("ef")).and_then(|v| v.as_u64()) {
+                sq = sq.with_ef(ef as usize);
+            }
+            let results = s.knowledge_store.search_query(&sq);
             let json_results: Vec<Value> = results.iter().map(|r| r.to_json_value()).collect();
             let mode = if s.knowledge_store.has_index() { "hnsw" } else { "linear" };
             RpcResponse::ok(serde_json::json!({"results":json_results,"mode":mode}), req.id)
@@ -254,6 +258,8 @@ async fn handle_request(req: RpcRequest, state: &RwLock<EngineState>) -> RpcResp
                 "count": s.knowledge_store.len(),
                 "dim":   s.knowledge_store.dim(),
                 "hnsw_ready": s.knowledge_store.has_index(),
+                "max_norm_deviation": s.knowledge_store.norm_report().max_deviation,
+                "rescaled_count": s.knowledge_store.norm_report().rescaled,
             }), req.id)
         }
 

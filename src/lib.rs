@@ -19,7 +19,7 @@ pub mod knowledge_store;
 pub use engine_error::EngineError;
 pub use hnsw_index::HnswIndex;
 pub use matrix::{dot, VectorMatrix};
-pub use knowledge_store::{BuiltIndex, IndexJob, KnowledgeItem, KnowledgeStore, SearchQuery, SearchResult};
+pub use knowledge_store::{BuiltIndex, IndexJob, KnowledgeItem, KnowledgeStore, NormReport, SearchQuery, SearchResult};
 pub use profile::Profile;
 pub use translator::{TranslationMatch, Translator};
 pub use validator::{MatchMode, ValidationMarker, ValidationResult, Validator};

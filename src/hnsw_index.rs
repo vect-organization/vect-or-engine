@@ -37,6 +37,11 @@ const EF_CONSTRUCTION: usize = 200;
 const EF_SEARCH: usize = 64;
 // mL = 1/ln(M) is computed at runtime in next_layer() since ln() is not const-stable.
 
+/// Default query-time width for a request of `top_k` results (A4): `max(64, 2 * top_k)`.
+pub fn default_ef(top_k: usize) -> usize {
+    EF_SEARCH.max(top_k.saturating_mul(2))
+}
+
 /// Index parameters. `Default` reproduces the compiled-in constants above.
 /// Experiments (benchmarks) use `HnswIndex::build_with` / `search_with` to vary them.
 #[derive(Clone, Copy, Debug, PartialEq)]
@@ -385,7 +390,7 @@ impl HnswIndex {
     ///
     /// Returns `(score, node_id)` pairs sorted by **descending** dot-product score.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(f32, usize)> {
-        self.search_with(query, top_k, self.params.ef_search)
+        self.search_with(query, top_k, self.params.ef_search.max(top_k.saturating_mul(2)))
     }
 
     /// Search with an explicit query-time width `ef_search` (used by the benchmark).
