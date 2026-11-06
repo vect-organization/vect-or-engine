@@ -59,6 +59,8 @@ pub struct SearchQuery<'a> {
     pub min_similarity: Option<f32>,
     /// Optional slot identifier for multi-vector domain routing.
     pub slot_id: Option<String>,
+    /// Query-time HNSW width (A4). `None` means `max(64, 2 * top_k)`. Ignored by the exact scan.
+    pub ef: Option<usize>,
 }
 
 impl<'a> SearchQuery<'a> {
@@ -69,7 +71,14 @@ impl<'a> SearchQuery<'a> {
             top_k: 10,
             min_similarity: None,
             slot_id: None,
+            ef: None,
         }
+    }
+
+    /// Set the HNSW query-time width (a larger value raises recall and costs time).
+    pub fn with_ef(mut self, ef: usize) -> Self {
+        self.ef = Some(ef);
+        self
     }
 
     /// Set the maximum number of results to return.
@@ -93,6 +102,13 @@ impl<'a> SearchQuery<'a> {
 
 // ─── KnowledgeStore ───────────────────────────────────────────────────────────
 
+/// Size below which the knowledge base is searched with the exact scan and no HNSW index is
+/// built (P2, A2). Chosen from the measurement in `verification/c2/` (owner decision
+/// 2026-11-06): on all cores the exact scan stays near 1 ms up to 10,000 items, its recall is
+/// always 1.0, while HNSW recall on uniform data falls to 0.48 at 10,000 and building the
+/// index takes up to 30 s.
+pub const EXACT_SCAN_MAX_ITEMS: usize = 10_000;
+
 /// The central in-memory knowledge base with pluggable search backends.
 pub struct KnowledgeStore {
     /// Metadata for each item (id + arbitrary JSON fields). Private (D11): the vectors, the
@@ -105,6 +121,56 @@ pub struct KnowledgeStore {
     /// Bumped by every load. An index built off-lock (P1) is installed only if this is
     /// still the value it was built from.
     generation: u64,
+    /// How far the loaded vectors were from unit length before normalisation (A1).
+    norm_report: NormReport,
+    /// Item count from which an HNSW index is used (default `EXACT_SCAN_MAX_ITEMS`).
+    exact_limit: usize,
+}
+
+/// Result of normalising a knowledge base at load (A1).
+#[derive(Debug, Clone, Copy, Default, PartialEq)]
+pub struct NormReport {
+    /// Largest `| ||v|| - 1 |` over all rows, measured before normalisation.
+    pub max_deviation: f64,
+    /// Rows that were rescaled (deviation above `NORM_TOLERANCE`).
+    pub rescaled: usize,
+}
+
+/// A row whose length differs from 1 by no more than this is left as it is, so a knowledge
+/// base that is already unit length keeps its exact bits.
+pub const NORM_TOLERANCE: f64 = 1e-5;
+
+/// L2 norm, accumulated in f64 so the deviation report is not limited by f32 rounding.
+fn l2_norm(v: &[f32]) -> f64 {
+    v.iter().map(|&x| f64::from(x) * f64::from(x)).sum::<f64>().sqrt()
+}
+
+/// Rescale `row` to unit length in place (a zero row stays zero). Returns the deviation
+/// `| ||row|| - 1 |` before the change and whether the row was rescaled.
+fn normalise_row(row: &mut [f32]) -> (f64, bool) {
+    let n = l2_norm(row);
+    let dev = (n - 1.0).abs();
+    if dev <= NORM_TOLERANCE || n == 0.0 {
+        return (dev, false);
+    }
+    for x in row.iter_mut() {
+        *x = (f64::from(*x) / n) as f32;
+    }
+    (dev, true)
+}
+
+/// Normalise every row of a flat buffer and report the deviation.
+fn normalise_all(dim: usize, data: &mut [f32]) -> NormReport {
+    let mut report = NormReport::default();
+    if dim == 0 {
+        return report;
+    }
+    for row in data.chunks_exact_mut(dim) {
+        let (dev, changed) = normalise_row(row);
+        report.max_deviation = report.max_deviation.max(dev);
+        report.rescaled += usize::from(changed);
+    }
+    report
 }
 
 impl Default for KnowledgeStore {
@@ -120,7 +186,15 @@ impl KnowledgeStore {
             matrix: Arc::new(VectorMatrix::default()),
             hnsw: None,
             generation: 0,
+            norm_report: NormReport::default(),
+            exact_limit: EXACT_SCAN_MAX_ITEMS,
         }
+    }
+
+    /// Change the item count from which an HNSW index is built and used (default
+    /// `EXACT_SCAN_MAX_ITEMS`). Takes effect at the next `build_index` and `search`.
+    pub fn set_exact_scan_limit(&mut self, items: usize) {
+        self.exact_limit = items;
     }
 
     /// Vector dimensionality of the loaded knowledge base (0 when nothing is loaded).
@@ -144,6 +218,11 @@ impl KnowledgeStore {
     /// Whether an HNSW index has been built.
     pub fn has_index(&self) -> bool {
         self.hnsw.is_some()
+    }
+
+    /// Deviation from unit length found at the last load, before normalisation (A1).
+    pub fn norm_report(&self) -> NormReport {
+        self.norm_report
     }
 
     // ── Loading ───────────────────────────────────────────────────────────────
@@ -192,14 +271,16 @@ impl KnowledgeStore {
             items.push(SlimItem { id: item.id, metadata: item.metadata });
         }
 
-        self.install(items, VectorMatrix::from_flat(new_dim, data)?);
+        let report = normalise_all(new_dim, &mut data);
+        self.install(items, VectorMatrix::from_flat(new_dim, data)?, report);
         Ok(count)
     }
 
     /// Replace the whole knowledge base in one step: items, vectors, dimension, a dropped
     /// index and a new generation. The only place the parallel vectors change.
-    fn install(&mut self, items: Vec<SlimItem>, matrix: VectorMatrix) {
+    fn install(&mut self, items: Vec<SlimItem>, matrix: VectorMatrix, norm_report: NormReport) {
         debug_assert_eq!(items.len(), matrix.len());
+        self.norm_report = norm_report;
         self.items = items;
         self.matrix = matrix.into_shared();
         self.hnsw = None;
@@ -220,8 +301,19 @@ impl KnowledgeStore {
     ///
     /// **CPU-intensive** — call this inside `tokio::task::spawn_blocking`.
     pub fn build_index(&mut self) {
+        // P2: a knowledge base under the threshold is searched exactly, so there is nothing to build.
+        if !self.wants_index() {
+            self.hnsw = None;
+            return;
+        }
         // `&mut self` is held throughout, so the generation cannot change.
         self.hnsw = Some(self.index_job().build().index);
+    }
+
+    /// Whether this knowledge base is large enough for an HNSW index (`EXACT_SCAN_MAX_ITEMS`).
+    /// Under it, `build_index` does nothing and `search` scans exactly.
+    pub fn wants_index(&self) -> bool {
+        self.items.len() >= self.exact_limit
     }
 
     /// P1: hand out what an index build needs (a shared matrix, no copy), so the build can run
@@ -256,13 +348,19 @@ impl KnowledgeStore {
             return Vec::new();
         }
         let top_k = query.top_k.min(MAX_TOP_K);
-        let results = if let Some(hnsw) = &self.hnsw {
-            let raw = hnsw.search(query.vector, top_k);
-            raw.into_iter()
-                .map(|(score, idx)| self.make_result(score, idx))
-                .collect::<Vec<_>>()
-        } else {
-            self.linear_search(query.vector, top_k)
+        // P2/A2: below the threshold the exact scan answers, even with an index built.
+        // A1: scores are cosine similarities, so the query is brought to unit length too.
+        let mut unit = query.vector.to_vec();
+        normalise_row(&mut unit);
+        let results = match &self.hnsw {
+            Some(hnsw) if self.items.len() >= self.exact_limit => {
+                let ef = query.ef.unwrap_or_else(|| crate::hnsw_index::default_ef(top_k));
+                hnsw.search_with(&unit, top_k, ef)
+                    .into_iter()
+                    .map(|(score, idx)| self.make_result(score, idx))
+                    .collect::<Vec<_>>()
+            }
+            _ => self.scan(&unit, top_k),
         };
 
         if let Some(min_score) = query.min_similarity {
@@ -284,6 +382,13 @@ impl KnowledgeStore {
     ///
     /// Suitable for ≤ ~10 K items or when HNSW is not yet built.
     pub fn linear_search(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
+        let mut unit = query.to_vec();
+        normalise_row(&mut unit);
+        self.scan(&unit, top_k)
+    }
+
+    /// The exact scan itself; `query` must already be unit length.
+    fn scan(&self, query: &[f32], top_k: usize) -> Vec<SearchResult> {
         let matrix = &self.matrix;
         let mut scores: Vec<(f32, usize)> = (0..matrix.len())
             .into_par_iter()
@@ -404,7 +509,8 @@ impl KnowledgeStore {
             return Err(EngineError::InvalidInput("the cache contains no items".into()));
         }
 
-        self.install(items, VectorMatrix::from_flat(dim, data)?);
+        let report = normalise_all(dim, &mut data);
+        self.install(items, VectorMatrix::from_flat(dim, data)?, report);
         Ok(n)
     }
 
@@ -484,7 +590,7 @@ mod tests {
                 metadata: serde_json::Map::new(),
             });
         }
-        store.install(items, VectorMatrix::from_flat(dim, data).unwrap());
+        store.install(items, VectorMatrix::from_flat(dim, data).unwrap(), NormReport::default());
         store
     }
 
@@ -642,6 +748,120 @@ mod tests {
     }
 
     #[test]
+    fn p2_small_kb_uses_exact() {
+        // Under the threshold nothing is built and every answer is the exact scan.
+        let n = EXACT_SCAN_MAX_ITEMS - 1;
+        let dim = 8;
+        let mut store = KnowledgeStore::new();
+        let mut data = Vec::new();
+        let mut items = Vec::new();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for i in 0..n {
+            let mut row: Vec<f32> = (0..dim)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect();
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            row.iter_mut().for_each(|v| *v /= norm);
+            data.extend(row);
+            items.push(SlimItem { id: Some(format!("i{i}")), metadata: serde_json::Map::new() });
+        }
+        store.install(items, VectorMatrix::from_flat(dim, data).unwrap(), NormReport::default());
+        assert!(!store.wants_index());
+        store.build_index();
+        assert!(!store.has_index(), "a small knowledge base builds no index");
+        for q in 0..n.min(40) {
+            let query = store.matrix.row(q).to_vec();
+            let via_search: Vec<usize> = store.search(&query, 10).into_iter().map(|r| r.idx).collect();
+            let exact: Vec<usize> = store.linear_search(&query, 10).into_iter().map(|r| r.idx).collect();
+            assert_eq!(via_search, exact);
+        }
+    }
+
+    #[test]
+    fn p2_large_kb_builds_and_uses_the_index() {
+        // At the threshold the index is built and answers; each stored vector finds itself first.
+        let limit = 400; // a small limit keeps the debug-build test fast
+        let n = limit;
+        let dim = 8;
+        let mut data = Vec::with_capacity(n * dim);
+        let mut items = Vec::with_capacity(n);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for i in 0..n {
+            let mut row: Vec<f32> = (0..dim)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect();
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            row.iter_mut().for_each(|v| *v /= norm);
+            data.extend(row);
+            items.push(SlimItem { id: Some(format!("i{i}")), metadata: serde_json::Map::new() });
+        }
+        let mut store = KnowledgeStore::new();
+        store.set_exact_scan_limit(limit);
+        store.install(items, VectorMatrix::from_flat(dim, data).unwrap(), NormReport::default());
+        assert!(store.wants_index());
+        store.build_index();
+        assert!(store.has_index());
+        let hits = (0..n)
+            .filter(|&q| {
+                let query = store.matrix.row(q).to_vec();
+                store.search(&query, 1).first().is_some_and(|r| r.idx == q)
+            })
+            .count();
+        assert!(hits >= n * 97 / 100, "the index found itself for {hits}/{n} stored vectors");
+        // The same store with the default limit scans exactly and builds nothing.
+        store.set_exact_scan_limit(EXACT_SCAN_MAX_ITEMS);
+        assert!(!store.wants_index());
+        store.build_index();
+        assert!(!store.has_index());
+    }
+
+    #[test]
+    fn a1_unnormalised_kb_is_normalised() {
+        // "long" and "far" point away from the query; "same" points the same way but is 5 long.
+        // Raw dot products would rank by length; cosine ranks by direction.
+        let mut store = KnowledgeStore::new();
+        let kb = write_kb(
+            r#"[{"id":"far","vector":[0.0,3.0]},{"id":"near","vector":[0.8,0.6]},{"id":"long","vector":[0.0,10.0]},{"id":"same","vector":[5.0,0.0]}]"#,
+        );
+        assert_eq!(store.load_from_path(&kb).unwrap(), 4);
+        std::fs::remove_file(kb).ok();
+
+        let rep = store.norm_report();
+        assert_eq!(rep.rescaled, 3, "near is already unit length");
+        assert!((rep.max_deviation - 9.0).abs() < 1e-9, "{rep:?}");
+        for i in 0..store.len() {
+            let n: f64 = store.matrix.row(i).iter().map(|&x| f64::from(x).powi(2)).sum::<f64>().sqrt();
+            assert!((n - 1.0).abs() < 1e-6, "row {i} has norm {n}");
+        }
+        // The query is scaled too: a query of length 7 gives cosine scores.
+        let top = store.linear_search(&[7.0, 0.0], 4);
+        assert_eq!(top[0].id.as_deref(), Some("same"));
+        assert!((top[0].score - 1.0).abs() < 1e-6);
+        assert_eq!(top[1].id.as_deref(), Some("near"));
+        assert!((top[1].score - 0.8).abs() < 1e-6);
+        assert!(top[2].score.abs() < 1e-6 && top[3].score.abs() < 1e-6);
+    }
+
+    #[test]
+    fn a4_ef_is_optional_and_defaults_to_twice_top_k() {
+        assert_eq!(crate::hnsw_index::default_ef(10), 64);
+        assert_eq!(crate::hnsw_index::default_ef(50), 100);
+        let q = [1.0f32, 0.0, 0.0, 0.0];
+        assert_eq!(SearchQuery::new(&q).ef, None);
+        assert_eq!(SearchQuery::new(&q).with_ef(300).ef, Some(300));
+    }
+
+    #[test]
     fn p3_index_and_store_share_one_matrix() {
         let mut store = make_store(30, 8);
         let job = store.index_job();
@@ -653,12 +873,13 @@ mod tests {
 
     #[test]
     fn a3_scores_are_exact_f32_not_f16_rounded() {
-        // 0.1 is not representable in f16 (it rounds to 0.099975586); f32 keeps it.
+        // 0.6 is not representable in f16 (it rounds to 0.6000977); f32 keeps it. The vector is
+        // (0.6, 0.8), already unit length, so A1 normalisation leaves it alone.
         let mut store = KnowledgeStore::new();
-        let kb = write_kb(r#"[{"id":"a","vector":[0.1,0.0]}]"#);
+        let kb = write_kb(r#"[{"id":"a","vector":[0.6,0.8]}]"#);
         store.load_from_path(&kb).unwrap();
         let score = store.linear_search(&[1.0, 0.0], 1)[0].score;
-        assert_eq!(score, 0.1f32);
+        assert_eq!(score, 0.6f32);
         std::fs::remove_file(kb).ok();
     }
 

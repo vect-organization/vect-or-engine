@@ -40,6 +40,10 @@ export interface JsKbInfo {
   count: number
   dim: number
   hnswReady: boolean
+  /** Largest `| ||v|| - 1 |` over the loaded vectors, measured before they were normalised (A1). */
+  maxNormDeviation: number
+  /** Number of vectors that were rescaled to unit length at load (A1). */
+  rescaledCount: number
 }
 /** Validates a document using the currently loaded profile. */
 export declare function validateSync(text: string): JsValidationResult
@@ -53,5 +57,5 @@ export declare function loadKnowledgeBase(path: string): Promise<number>
 export declare function loadKbCache(path: string): Promise<number>
 export declare function saveKbCache(path: string): Promise<void>
 export declare function buildIndex(): Promise<number>
-export declare function search(query: Float32Array, topK: number): Promise<Array<JsSearchResult>>
+export declare function search(query: Float32Array, topK: number, ef?: number | undefined | null): Promise<Array<JsSearchResult>>
 export declare function kbInfo(): Promise<JsKbInfo>

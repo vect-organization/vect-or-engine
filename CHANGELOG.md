@@ -28,6 +28,19 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ---
 
+## [0.3.11] - 2026-11-06
+
+Phase C2 to C4 of the 0.4.0 work (search core). Change-log rows: `docs/changes/v0.4.0.csv` (P2, P5, A1, A2, A4). Measurements: `verification/c2/`, `verification/c3/`.
+
+### Changed
+- **P2, A2**: a knowledge base under 10,000 items is searched with the exact scan (recall 1.0) and `buildIndex` builds nothing for it (it returns the count; `hnswReady` stays false). From 10,000 items on, `buildIndex` builds the HNSW index and `search` uses it. The threshold comes from a measurement of the store's parallel scan: about 1 ms up to 10,000 items on 8 cores, while HNSW recall on uniform data falls to 0.48 at 10,000 and building the index takes up to 30 s (`verification/c2/threshold_parallel_2026-11-06.md`). Every dictionary in use today has fewer than 2,000 items, so none of them builds an index any more
+- **A1**: vectors are normalised to unit length at load and the query at search time, so scores are cosine similarities. `kbInfo()` returns `maxNormDeviation` (the largest distance of a vector length from 1 before normalising) and `rescaledCount`. A knowledge base loaded from the SQLite cache reports every row as rescaled, because f16 rounding moves the length by about 1e-3
+- **A4**: `search(query, topK, ef?)` takes an optional HNSW width; the default is `max(64, 2 * topK)`. The exact scan ignores it
+- **P5**: index build and search use an epoch array for visited nodes instead of a `HashSet` per search, no neighbour-list clones, and the whole candidate set of a layer as the entry set of the next. Index build time is 8 to 40 percent shorter at equal recall (`verification/c3/`)
+- Rust API: `SearchQuery::ef` and `with_ef`, `KnowledgeStore::norm_report`, `KnowledgeStore::wants_index`, `NormReport`, `hnsw_index::default_ef`
+
+---
+
 ## [0.3.10] - 2026-11-06
 
 Phase C1 of the 0.4.0 work (search core). Change-log rows: `docs/changes/v0.4.0.csv` (P3, P4, R1, R5, A3). Measurements: `verification/phase_c1/`.

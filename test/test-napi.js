@@ -44,13 +44,19 @@ async function testKnowledgeStore() {
     assert.strictEqual(indexCount, 3, 'Should index 3 items');
 
     const info = await kbInfo();
-    assert.deepStrictEqual(info, { count: 3, dim: 3, hnswReady: true });
+    assert.strictEqual(info.count, 3);
+    assert.strictEqual(info.dim, 3);
+    // P2: a knowledge base under 10,000 items is searched exactly and builds no index.
+    assert.strictEqual(info.hnswReady, false);
+    // A1: vec-1 has length 0.927, so one vector is rescaled and the deviation is reported.
+    assert.strictEqual(info.rescaledCount, 1);
+    assert(Math.abs(info.maxNormDeviation - 0.0725) < 0.001, `deviation ${info.maxNormDeviation}`);
 
     const query = new Float32Array([0.1, 0.9, 0.2]);
     const results = await search(query, 1);
     assert.strictEqual(results.length, 1, 'Should return 1 result');
     assert.strictEqual(results[0].id, 'vec-1', 'The nearest vector should be vec-1');
-    assert(results[0].score > 0.85, `Score should be close to 0.9, got ${results[0].score}`);
+    assert(results[0].score > 0.85, `Score should be close to 1 (cosine), got ${results[0].score}`);
 
     console.log('✅ KnowledgeStore tests passed.');
 }

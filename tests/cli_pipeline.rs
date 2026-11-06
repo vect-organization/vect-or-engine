@@ -58,7 +58,8 @@ fn d10_cli_pipelined_load_then_build() {
     let ids: Vec<&str> = replies.iter().map(|r| r["id"].as_str().unwrap()).collect();
     assert_eq!(ids, ["1", "2", "3", "4"], "{replies:?}");
     assert!(replies.iter().all(|r| r["success"] == true), "{replies:?}");
-    assert_eq!(replies[2]["data"]["mode"], "hnsw");
+    // Two items are far under the index threshold, so the exact scan answers.
+    assert_eq!(replies[2]["data"]["mode"], "linear");
     assert_eq!(replies[2]["data"]["results"][0]["id"], "a");
 }
 

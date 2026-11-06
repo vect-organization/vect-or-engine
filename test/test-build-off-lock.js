@@ -14,8 +14,9 @@ const path = require('path');
 const assert = require('assert');
 const { loadKnowledgeBase, buildIndex, validateSync, search, kbInfo } = require('../index.js');
 
-const N = 3000;
-const DIM = 384;
+// 10,000 is the smallest knowledge base that builds an index (P2); fewer items return at once.
+const N = 10000;
+const DIM = 32;
 const MAX_STALL_MS = 250;
 
 function randomKb(n, dim) {

@@ -19,7 +19,8 @@
 //! - `select_nth_unstable` for O(N) top-K without full sort.
 
 use std::cmp::Ordering;
-use std::collections::{BinaryHeap, HashSet};
+use std::cell::RefCell;
+use std::collections::BinaryHeap;
 use std::sync::Arc;
 
 use crate::engine_error::EngineError;
@@ -36,6 +37,11 @@ const EF_CONSTRUCTION: usize = 200;
 /// Query-time search width.
 const EF_SEARCH: usize = 64;
 // mL = 1/ln(M) is computed at runtime in next_layer() since ln() is not const-stable.
+
+/// Default query-time width for a request of `top_k` results (A4): `max(64, 2 * top_k)`.
+pub fn default_ef(top_k: usize) -> usize {
+    EF_SEARCH.max(top_k.saturating_mul(2))
+}
 
 /// Index parameters. `Default` reproduces the compiled-in constants above.
 /// Experiments (benchmarks) use `HnswIndex::build_with` / `search_with` to vary them.
@@ -97,6 +103,42 @@ impl Ord for MaxCand {
     fn cmp(&self, o: &Self) -> Ordering {
         self.0.total_cmp(&o.0)
     }
+}
+
+// ─── Visited marks (P5) ────────────────────────────────────────────────────────
+
+/// Per-thread epoch array replacing a `HashSet` per search: node `i` is visited when
+/// `marks[i] == epoch`. A new search bumps the epoch, so nothing is cleared or allocated.
+#[derive(Default)]
+struct Visited {
+    marks: Vec<u32>,
+    epoch: u32,
+}
+
+impl Visited {
+    fn begin(&mut self, nodes: usize) {
+        if self.marks.len() < nodes {
+            self.marks.resize(nodes, 0);
+        }
+        self.epoch = self.epoch.wrapping_add(1);
+        if self.epoch == 0 {
+            // The counter wrapped: old marks could equal the new epoch, so start clean.
+            self.marks.iter_mut().for_each(|m| *m = 0);
+            self.epoch = 1;
+        }
+    }
+
+    /// Marks `i` and returns whether it was already marked.
+    #[inline]
+    fn test_and_set(&mut self, i: usize) -> bool {
+        let seen = self.marks[i] == self.epoch;
+        self.marks[i] = self.epoch;
+        seen
+    }
+}
+
+thread_local! {
+    static VISITED: RefCell<Visited> = RefCell::new(Visited::default());
 }
 
 // ─── HNSW Index ───────────────────────────────────────────────────────────────
@@ -198,22 +240,39 @@ impl HnswIndex {
 
     // ── Core: search within one layer ────────────────────────────────────────
 
-    fn search_layer(
+    /// Best-first search on one layer, starting from every node in `entries` (the whole
+    /// candidate set of the layer above, not just its nearest node). Returns up to `ef`
+    /// `(distance, node)` pairs sorted by ascending distance, ties by node id (R1).
+    fn search_layer(&self, query: &[f32], entries: &[usize], ef: usize, layer: usize) -> Vec<(f32, usize)> {
+        VISITED.with(|cell| {
+            let mut visited = cell.borrow_mut();
+            visited.begin(self.nodes.len());
+            self.search_layer_with(&mut visited, query, entries, ef, layer)
+        })
+    }
+
+    fn search_layer_with(
         &self,
+        visited: &mut Visited,
         query: &[f32],
-        entry: usize,
+        entries: &[usize],
         ef: usize,
         layer: usize,
     ) -> Vec<(f32, usize)> {
-        let mut visited: HashSet<usize> = HashSet::new();
-        let ep_dist = Self::dist(query, self.matrix.row(entry));
-
         let mut candidates: BinaryHeap<MinCand> = BinaryHeap::new();
         let mut window: BinaryHeap<MaxCand> = BinaryHeap::new();
 
-        candidates.push(MinCand(ep_dist, entry));
-        window.push(MaxCand(ep_dist, entry));
-        visited.insert(entry);
+        for &entry in entries {
+            if visited.test_and_set(entry) {
+                continue;
+            }
+            let d = Self::dist(query, self.matrix.row(entry));
+            candidates.push(MinCand(d, entry));
+            window.push(MaxCand(d, entry));
+            if window.len() > ef {
+                window.pop();
+            }
+        }
 
         while let Some(MinCand(c_dist, c_idx)) = candidates.pop() {
             // Pruning: if nearest candidate is farther than worst in window → stop.
@@ -231,10 +290,9 @@ impl HnswIndex {
                 .unwrap_or(&[]);
 
             for &nb in neighbours {
-                if visited.contains(&nb) {
+                if visited.test_and_set(nb) {
                     continue;
                 }
-                visited.insert(nb);
 
                 let nb_dist = Self::dist(query, self.matrix.row(nb));
                 let worst = window.peek().map(|x| x.0).unwrap_or(f32::MAX);
@@ -249,10 +307,9 @@ impl HnswIndex {
             }
         }
 
-        // Collect and sort ascending by distance; equal distances go by node id (R1), so the
-        // order never depends on heap internals.
-        let mut result: Vec<(f32, usize)> =
-            window.into_iter().map(|x| (x.0, x.1)).collect();
+        // Sort ascending by distance; equal distances go by node id (R1), so the order never
+        // depends on heap internals.
+        let mut result: Vec<(f32, usize)> = window.into_iter().map(|x| (x.0, x.1)).collect();
         result.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
         result
     }
@@ -320,7 +377,7 @@ impl HnswIndex {
 
         self.nodes.push(Node { layers: vec![Vec::new(); node_layer + 1] });
 
-        let Some(mut ep) = self.entry_point else {
+        let Some(ep) = self.entry_point else {
             // First node — becomes entry point.
             self.entry_point = Some(node_id);
             self.max_layer = node_layer;
@@ -328,47 +385,47 @@ impl HnswIndex {
         };
 
         let top = self.max_layer;
+        let mut eps: Vec<usize> = vec![ep];
 
         // Phase 1: greedy descent from top_layer to node_layer+1.
         for lc in (node_layer + 1..=top).rev() {
-            let nearest = self.search_layer(vector, ep, 1, lc);
-            if let Some((_, nb)) = nearest.into_iter().next() {
-                ep = nb;
+            let nearest = self.search_layer(vector, &eps, 1, lc);
+            if let Some(&(_, nb)) = nearest.first() {
+                eps = vec![nb];
             }
         }
 
-        // Phase 2: insert with ef_construction at each layer ≤ node_layer.
+        // Phase 2: insert with ef_construction at each layer <= node_layer. The candidate set
+        // of one layer is the entry set of the next (P5).
         for lc in (0..=node_layer.min(top)).rev() {
             let cap = self.cap_at(lc);
-            let candidates = self.search_layer(vector, ep, self.params.ef_construction, lc);
+            let candidates = self.search_layer(vector, &eps, self.params.ef_construction, lc);
 
             // Select neighbours (nearest first, or the diversity heuristic).
-            let neighbours: Vec<usize> = self.select_neighbours(&candidates, cap);
-
-            // Set outgoing edges for new node.
-            self.nodes[node_id].layers[lc] = neighbours.clone();
+            self.nodes[node_id].layers[lc] = self.select_neighbours(&candidates, cap);
 
             // Add incoming edges + prune to the layer cap if needed.
-            for &nb in &neighbours {
+            for i in 0..self.nodes[node_id].layers[lc].len() {
+                let nb = self.nodes[node_id].layers[lc][i];
                 if lc >= self.nodes[nb].layers.len() {
                     self.nodes[nb].layers.resize(lc + 1, Vec::new());
                 }
-                let mut conn = self.nodes[nb].layers[lc].clone();
-                conn.push(node_id);
+                self.nodes[nb].layers[lc].push(node_id);
 
-                if conn.len() > cap {
+                if self.nodes[nb].layers[lc].len() > cap {
+                    let conn = std::mem::take(&mut self.nodes[nb].layers[lc]);
                     let nb_vec = matrix.row(nb);
-                    let mut distances: Vec<(f32, usize)> = conn.iter()
+                    let mut distances: Vec<(f32, usize)> = conn
+                        .iter()
                         .map(|&idx| (Self::dist(nb_vec, matrix.row(idx)), idx))
                         .collect();
                     distances.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
-                    conn = self.select_neighbours(&distances, cap);
+                    self.nodes[nb].layers[lc] = self.select_neighbours(&distances, cap);
                 }
-                self.nodes[nb].layers[lc] = conn;
             }
 
-            if let Some((_, nearest)) = candidates.first() {
-                ep = *nearest;
+            if !candidates.is_empty() {
+                eps = candidates.iter().map(|&(_, i)| i).collect();
             }
         }
 
@@ -385,7 +442,7 @@ impl HnswIndex {
     ///
     /// Returns `(score, node_id)` pairs sorted by **descending** dot-product score.
     pub fn search(&self, query: &[f32], top_k: usize) -> Vec<(f32, usize)> {
-        self.search_with(query, top_k, self.params.ef_search)
+        self.search_with(query, top_k, self.params.ef_search.max(top_k.saturating_mul(2)))
     }
 
     /// Search with an explicit query-time width `ef_search` (used by the benchmark).
@@ -396,7 +453,7 @@ impl HnswIndex {
 
         // Greedy descent from max_layer to layer 1.
         for lc in (1..=self.max_layer).rev() {
-            let candidates = self.search_layer(query, ep, 1, lc);
+            let candidates = self.search_layer(query, &[ep], 1, lc);
             if let Some((_, nb)) = candidates.into_iter().next() {
                 ep = nb;
             }
@@ -404,7 +461,7 @@ impl HnswIndex {
 
         // Full ef-wide search at layer 0.
         let ef = ef_search.max(top_k);
-        let candidates = self.search_layer(query, ep, ef, 0);
+        let candidates = self.search_layer(query, &[ep], ef, 0);
 
         candidates
             .into_iter()
@@ -483,6 +540,81 @@ mod tests {
         for q in rows.iter().step_by(37) {
             assert_eq!(a.search(q, 10), b.search(q, 10));
         }
+    }
+
+impl HnswIndex {
+    /// The pre-C3 search: a fresh `HashSet` per call and one entry node. Kept as the reference
+    /// the epoch-array version must equal.
+    fn search_layer_reference(&self, query: &[f32], entry: usize, ef: usize, layer: usize) -> Vec<(f32, usize)> {
+        let mut visited: std::collections::HashSet<usize> = std::collections::HashSet::new();
+        let ep_dist = Self::dist(query, self.matrix.row(entry));
+        let mut candidates: BinaryHeap<MinCand> = BinaryHeap::new();
+        let mut window: BinaryHeap<MaxCand> = BinaryHeap::new();
+        candidates.push(MinCand(ep_dist, entry));
+        window.push(MaxCand(ep_dist, entry));
+        visited.insert(entry);
+        while let Some(MinCand(c_dist, c_idx)) = candidates.pop() {
+            if let Some(MaxCand(worst, _)) = window.peek() {
+                if c_dist > *worst {
+                    break;
+                }
+            }
+            let neighbours = self.nodes.get(c_idx).and_then(|n| n.layers.get(layer)).map(|v| v.as_slice()).unwrap_or(&[]);
+            for &nb in neighbours {
+                if visited.contains(&nb) {
+                    continue;
+                }
+                visited.insert(nb);
+                let nb_dist = Self::dist(query, self.matrix.row(nb));
+                let worst = window.peek().map(|x| x.0).unwrap_or(f32::MAX);
+                if nb_dist < worst || window.len() < ef {
+                    candidates.push(MinCand(nb_dist, nb));
+                    window.push(MaxCand(nb_dist, nb));
+                    if window.len() > ef {
+                        window.pop();
+                    }
+                }
+            }
+        }
+        let mut result: Vec<(f32, usize)> = window.into_iter().map(|x| (x.0, x.1)).collect();
+        result.sort_unstable_by(|a, b| a.0.total_cmp(&b.0).then(a.1.cmp(&b.1)));
+        result
+    }
+}
+
+    #[test]
+    fn p5_epoch_search_equals_the_hashset_search_on_a_fixed_graph() {
+        let rows: Vec<Vec<f32>> = (0..400)
+            .map(|i| (0..12).map(|j| (((i * 37 + j * 11 + i * j) % 29) as f32) - 14.0).collect())
+            .collect();
+        let idx = HnswIndex::build(&rows).unwrap();
+        let ep = idx.entry_point.unwrap();
+        for (n, q) in rows.iter().step_by(13).enumerate() {
+            for &(ef, layer) in &[(1usize, 1usize), (10, 0), (64, 0), (200, 0)] {
+                let layer = layer.min(idx.max_layer);
+                assert_eq!(
+                    idx.search_layer(q, &[ep], ef, layer),
+                    idx.search_layer_reference(q, ep, ef, layer),
+                    "query {n}, ef {ef}, layer {layer}"
+                );
+            }
+        }
+        // Many searches in a row reuse one epoch array: the answers must not drift.
+        let first = idx.search(&rows[3], 10);
+        for _ in 0..50 {
+            assert_eq!(idx.search(&rows[3], 10), first);
+        }
+    }
+
+    #[test]
+    fn p5_visited_epoch_wraps_without_stale_marks() {
+        let mut v = Visited { marks: vec![0; 4], epoch: u32::MAX };
+        v.begin(4); // wraps to 0, cleared, epoch 1
+        assert_eq!(v.epoch, 1);
+        assert!(!v.test_and_set(2));
+        assert!(v.test_and_set(2));
+        v.begin(4);
+        assert!(!v.test_and_set(2), "a new epoch forgets the old marks");
     }
 
     #[test]
