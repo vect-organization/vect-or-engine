@@ -31,7 +31,8 @@ use crate::engine_error::EngineError;
 const CACHE_FORMAT_VERSION: u32 = 1;
 
 #[cfg(not(feature = "cache"))]
-const NO_CACHE: &str = "this build has no SQLite cache support (cargo feature `cache`)";
+const NO_CACHE: &str =
+    "this build has no SQLite cache support; build with the cargo feature `cache` (for the CLI: `cargo run --features cli,cache --bin vect_or_engine_cli`)";
 
 /// 64-bit FNV-1a over the rows of a cache, in order; detects a cache whose rows were edited or
 /// truncated after it was written. It is a consistency check, not a defence against an attacker.
@@ -505,6 +506,10 @@ impl KnowledgeStore {
         let tmp = format!("{db_path}.tmp-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
         let _ = fs::remove_file(&tmp);
         let result = self.write_cache_file(&tmp, model_id).and_then(|()| {
+            // A journal or WAL file left beside the target by an older version's crashed
+            // in-place write must not be paired with the new database.
+            let _ = fs::remove_file(format!("{db_path}-journal"));
+            let _ = fs::remove_file(format!("{db_path}-wal"));
             fs::rename(&tmp, db_path).map_err(|e| EngineError::Database(format!("cannot replace the cache: {e}")))
         });
         if result.is_err() {
@@ -581,11 +586,21 @@ impl KnowledgeStore {
                 "the cache has format version {version}, this engine reads {CACHE_FORMAT_VERSION}; rebuild it"
             )));
         }
-        if let (Some(want), Some(have)) = (model_id, get("model_id")) {
-            if want != have {
-                return Err(EngineError::InvalidInput(format!(
-                    "the cache was built with model '{have}', not '{want}'; rebuild it"
-                )));
+        // A requested model must match the stored one; a cache that stores no model id cannot
+        // prove it, so it is rejected too. Without a requested model any cache is accepted.
+        if let Some(want) = model_id {
+            match get("model_id") {
+                Some(have) if have == want => {}
+                Some(have) => {
+                    return Err(EngineError::InvalidInput(format!(
+                        "the cache was built with model '{have}', not '{want}'; rebuild it"
+                    )));
+                }
+                None => {
+                    return Err(EngineError::InvalidInput(format!(
+                        "the cache stores no model id, so it cannot be checked against '{want}'; rebuild it with a model id"
+                    )));
+                }
             }
         }
 
@@ -847,6 +862,7 @@ mod tests {
         std::fs::remove_file(empty).ok();
     }
 
+    #[cfg(feature = "cache")]
     fn cache_path(tag: &str) -> String {
         std::env::temp_dir()
             .join(format!("vect-cache-{tag}-{}.db", std::process::id()))
@@ -954,6 +970,15 @@ mod tests {
         let mut keep = make_store(2, 4);
         assert!(keep.load_from_sqlite_with(&db, Some("model-b")).is_err());
         assert_eq!(keep.len(), 2, "a rejected cache keeps the previous knowledge base");
+        // A model id requested against a cache that stores none is rejected; no request accepts any.
+        let anon = cache_path("r4-anon");
+        src.save_to_sqlite_with(&anon, None).unwrap();
+        let e = keep.load_from_sqlite_with(&anon, Some("model-a")).unwrap_err().to_string();
+        assert!(e.contains("no model id"), "{e}");
+        assert_eq!(keep.len(), 2);
+        assert_eq!(keep.load_from_sqlite_with(&anon, None).unwrap(), 4);
+        std::fs::remove_file(anon).ok();
+        let mut keep = make_store(2, 4);
         // Every header field is checked against the rows.
         for (key, bad) in [("format_version", "99"), ("dim", "5"), ("count", "9"), ("content_hash", "0000000000000000")] {
             let copy = cache_path(&format!("r4-{key}"));

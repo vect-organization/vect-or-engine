@@ -34,7 +34,7 @@ Phase D of the 0.4.0 work (cache and input). Change-log rows: `docs/changes/v0.4
 
 ### Added
 - **P8**: `loadKnowledgeBaseFromString(json)` loads a knowledge base from JSON text held in memory, with the same format, limits and errors as `loadKnowledgeBase`; a failure keeps the previous one. No file is read or written
-- **R4**: the SQLite cache has a header (format version, dimension, item count, a hash of the rows and, when given, the model id). `saveKbCache(path, modelId?)` and `loadKbCache(path, modelId?)` take an optional model id; a cache with another model, a missing or mismatching header or edited rows is rejected and the loaded knowledge base is kept
+- **R4**: the SQLite cache has a header (format version, dimension, item count, a hash of the rows and, when given, the model id). `saveKbCache(path, modelId?)` and `loadKbCache(path, modelId?)` take an optional model id; a cache with another model (or, when a model id is requested, with none stored), a missing or mismatching header or edited rows is rejected and the loaded knowledge base is kept
 
 ### Changed
 - **P7 (breaking cache format)**: the cache is written to a temporary file in one transaction and renamed over the target, so a crash leaves the old cache or none. **Caches written by 0.3.13 and earlier have no header and are rejected; rebuild them from the JSON**
