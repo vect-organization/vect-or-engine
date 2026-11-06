@@ -16,7 +16,7 @@ P1,performance,,The write lock is held for the whole build; validateSync waits 9
 P2,performance,,HNSW is used even for small KBs,Recall below 1 and a build cost,Exact scan below a measured threshold,p2_small_kb_uses_exact (bench in verification/c2; exact below 2000 items),No,C,0.3.10,done,
 P3,performance,,f16 store plus an f32 copy in HNSW; the f16 dot is 12–17× slower,Slow linear path; 6 bytes per dimension,One flat f32 matrix,p3_index_and_store_share_one_matrix,No,C,0.3.10,done,
 P4,performance,,4-accumulator dot product with get_unchecked,Slower and unsafe,Safe 16-lane dot product,safe_dot_matches_a_plain_sum,No,C,0.3.10,done,
-P5,performance,,"A HashSet per search, list clones, a single entry point per layer",Build time and graph quality,"Epoch visited array, no clones, full candidate set as entry",bench build time and recall,No,C,,planned,
+P5,performance,,"A HashSet per search, list clones, a single entry point per layer",Build time and graph quality,"Epoch visited array, no clones, full candidate set as entry",p5_epoch_search_equals_the_hashset_search_on_a_fixed_graph (bench in verification/c3),No,C,0.3.10,done,
 P6,performance,,"Each trigger word scans the whole text (1,000 rules: 6–10 ms)",Cost grows with the rule count,One Aho-Corasick and one RegexSet pass,bench validator rows,No,E,,planned,
 P7,performance,,Cache save commits once per row,Slow; a crash leaves a partial cache,One transaction; temp file and rename,p7_cache_save_is_atomic,No,D,,planned,
 P8,performance,,The KB is passed only as a JSON file,Disk write and reparse,Same change as S1,See S1,,D,,planned,
