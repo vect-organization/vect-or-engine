@@ -27,7 +27,7 @@ A4,accuracy,,efSearch is fixed at 64 (uniform 10k recall 0.474),Low recall on la
 A5,accuracy,,,Covered by D5 and D6,,,,,,dropped,
 A6,accuracy,,"The linter sees raw text, so full-width codes miss",Missed rule hits,Optional NFKC and case fold with an offset map,a6_nfkc_option_maps_offsets,No (opt-in),E,0.3.12,done,
 R1,reproducibility,,"Equal scores are not in id order ([501, 500, 503, 502, 10])",Order changes with internals,"Sort by score descending, then idx ascending",r1_ties_ordered_by_idx,No,C,0.3.10,done,
-R2,reproducibility,,Sequential build with a fixed seed gives the same graph,Keep this property,Parallel build only as an opt-in,r2_two_builds_equal (f11),No,C,,planned,
+R2,reproducibility,,Sequential build with a fixed seed gives the same graph,Keep this property,Sequential build stays the only build (deterministic); the opt-in parallel build is not added in 0.4.0 (docs/changes/parallel-build-deferred.md),r2_two_builds_equal,No,C,0.4.0,done,
 R3,reproducibility,,"The build time is embedded, so binaries differ",Builds are not reproducible,Honour SOURCE_DATE_EPOCH,check_reproducible_build (scripts/check-reproducible-build.mjs builds twice with SOURCE_DATE_EPOCH and compares SHA-256),No,F,0.3.13,done,
 R4,reproducibility,,"The cache has no version, model id, dim or hash",A stale cache is loaded silently,A header checked at load,r4_cache_header_mismatch_rejected,Yes (cache format),D,0.3.14,done,
 R5,reproducibility,,No SIMD dispatch yet,Scores could drift across CPUs,One fixed summation order on every path,r5_dot_uses_one_fixed_summation_order,No,C,0.3.10,done,

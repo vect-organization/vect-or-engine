@@ -20,6 +20,7 @@ The MCP request gate described below was added and then removed together with th
 - Tests: `test/test-engine-build-check.mjs` (7 verdict cases on the git history) and `test/test-match-modes.js`; the `Rust` CI workflow checks out the full history and runs the build-check tests on Node.js 24 (PR #26)
 
 ### Changed
+- **R2**: the index build stays sequential and reproducible (same input, same graph); the opt-in parallel build is deferred, with the reasons and the trigger to reopen it in `docs/changes/parallel-build-deferred.md`
 - `engines.node` is `>= 24` (was `>= 18`, end of life); README Node.js requirement updated
 - Removed the `Badge metadata` workflow and `.github/badges/`: its push to `main` is refused by the branch rule ("Changes must be made through a pull request", first run after PR #33). The README version badge reads `package.json` directly and the Rust edition badge is static
 
