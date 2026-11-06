@@ -1,6 +1,6 @@
 [package]
 name = "vect_or_engine"
-version = "0.3.12"
+version = "0.3.13"
 edition = "2021"
 rust-version = "1.88"
 authors = ["1abcdefggs"]
@@ -24,6 +24,8 @@ default = ["cli"]
 # The headless CLI is the only code that needs the full tokio feature set.
 cli = ["dep:tokio", "tokio/macros", "tokio/io-util", "tokio/io-std"]
 napi = ["dep:napi", "dep:napi-derive", "dep:tokio"]
+# Exports a function that panics on purpose, for the S5 Node test. Not for release builds.
+test-hooks = ["napi"]
 
 [dependencies]
 # N-API bindings (only with --features napi; the CLI and CI cargo builds stay free of napi_* symbols)

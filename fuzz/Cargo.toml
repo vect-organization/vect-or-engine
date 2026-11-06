@@ -1,0 +1,41 @@
+# Fuzz targets (change-log S8). A separate crate with its own workspace, so a plain
+# `cargo build` / `cargo test` in the repository root never builds it.
+# Run (nightly + cargo-fuzz): cargo +nightly fuzz run search   (also: load, rules)
+[package]
+name = "vect_or_engine_fuzz"
+version = "0.0.0"
+publish = false
+edition = "2021"
+
+[package.metadata]
+cargo-fuzz = true
+
+[dependencies]
+libfuzzer-sys = "0.4"
+
+[dependencies.vect_or_engine]
+path = ".."
+default-features = false
+
+[workspace]
+
+[[bin]]
+name = "search"
+path = "fuzz_targets/search.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "load"
+path = "fuzz_targets/load.rs"
+test = false
+doc = false
+bench = false
+
+[[bin]]
+name = "rules"
+path = "fuzz_targets/rules.rs"
+test = false
+doc = false
+bench = false

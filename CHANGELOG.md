@@ -28,6 +28,19 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ---
 
+## [0.3.13] - 2026-11-06
+
+Phase F of the 0.4.0 work (gates). Change-log rows: `docs/changes/v0.4.0.csv` (R3, S5, S8, S9; S9 waits for an owner decision).
+
+### Changed
+- **R3**: `build.rs` uses `SOURCE_DATE_EPOCH` for the embedded build time when it is a valid integer, so two builds of the same source give the same binary. `node scripts/check-reproducible-build.mjs` builds twice and compares SHA-256 (on MSVC it adds `/Brepro` for the check only; the normal build is unchanged). Result on Windows: identical
+- **S5**: every synchronous N-API export uses `catch_unwind`, so a Rust panic reaches JavaScript as an `Error` instead of unwinding across the C boundary and ending the host process. `test/test-panic-to-js-error.mjs` builds with the `test-hooks` feature (an export that panics on purpose), loads it and checks that the error arrives and the engine still answers. CI runs it
+- **S8**: `deny.toml` and a `deny` job (cargo-deny: advisories, licences, bans, sources) on every pull request; three cargo-fuzz targets in `fuzz/` (`load`, `rules`, `search`); a fixed-seed property test that the exact scan equals a naive reference
+- **S9**: the leftovers of the experimental MCP server are recorded in `docs/changes/mcp-server-leftovers.md` (CORS value, token off by default, stale binary names, unguarded `OPTIONS`). Nothing was changed; the owner decides whether to keep or remove the server
+- New CI job needs `EmbarkStudios/cargo-deny-action@v2`
+
+---
+
 ## [0.3.12] - 2026-11-06
 
 Phase E of the 0.4.0 work (linter). Change-log rows: `docs/changes/v0.4.0.csv` (P6, D5, A6). Measurements: `verification/validator/p6_bench.md`.

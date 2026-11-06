@@ -26,11 +26,18 @@ fn main() {
         .map(|o| (!o.stdout.is_empty()).to_string())
         .unwrap_or_else(|| "unknown".to_string());
 
-    // Build time as UNIX seconds. Re-evaluated whenever this script reruns.
-    let built_at_unix = SystemTime::now()
-        .duration_since(UNIX_EPOCH)
-        .map(|d| d.as_secs())
-        .unwrap_or(0);
+    // Build time as UNIX seconds. SOURCE_DATE_EPOCH (https://reproducible-builds.org/specs/source-date-epoch/)
+    // wins when it is a valid integer, so two builds of the same source give the same binary.
+    // Otherwise the current time is used and the script reruns with the rest of the build.
+    let built_at_unix = std::env::var("SOURCE_DATE_EPOCH")
+        .ok()
+        .and_then(|v| v.trim().parse::<u64>().ok())
+        .unwrap_or_else(|| {
+            SystemTime::now()
+                .duration_since(UNIX_EPOCH)
+                .map(|d| d.as_secs())
+                .unwrap_or(0)
+        });
 
     println!("cargo:rustc-env=VECT_GIT_HASH={git_hash}");
     println!("cargo:rustc-env=VECT_GIT_DIRTY={git_dirty}");
@@ -38,6 +45,7 @@ fn main() {
 
     // Rerun when anything that is compiled into the binary changes, not only when git HEAD moves,
     // so the build time and dirty flag stay current.
+    println!("cargo:rerun-if-env-changed=SOURCE_DATE_EPOCH");
     println!("cargo:rerun-if-changed=build.rs");
     println!("cargo:rerun-if-changed=Cargo.toml");
     println!("cargo:rerun-if-changed=src");
