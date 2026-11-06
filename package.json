@@ -60,7 +60,7 @@
     "node": ">= 24"
   },
   "scripts": {
-    "test": "node test/test-napi.js && node test/test-build-off-lock.js && node test/test-load-from-string.js",
+    "test": "node test/test-napi.js && node test/test-build-off-lock.js && node test/test-load-from-string.js && node test/test-load-off-lock.js",
     "artifacts": "napi artifacts",
     "build": "napi build --platform --release --features napi,cache",
     "build:debug": "napi build --platform --features napi,cache",
