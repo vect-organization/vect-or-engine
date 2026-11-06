@@ -74,7 +74,7 @@ impl VectorMatrix {
         if dim == 0 && !data.is_empty() {
             return Err(EngineError::InvalidInput("a matrix with dimension 0 cannot hold values".into()));
         }
-        if dim != 0 && data.len() % dim != 0 {
+        if dim != 0 && !data.len().is_multiple_of(dim) {
             return Err(EngineError::InvalidInput(format!(
                 "{} values do not fill whole rows of {dim} components", data.len()
             )));
@@ -111,7 +111,7 @@ impl VectorMatrix {
 
     /// Number of rows.
     pub fn len(&self) -> usize {
-        if self.dim == 0 { 0 } else { self.data.len() / self.dim }
+        self.data.len().checked_div(self.dim).unwrap_or(0)
     }
 
     pub fn is_empty(&self) -> bool {
