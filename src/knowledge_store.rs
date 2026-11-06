@@ -102,9 +102,12 @@ impl<'a> SearchQuery<'a> {
 
 // ─── KnowledgeStore ───────────────────────────────────────────────────────────
 
-/// Size below which `search` uses the exact scan even when an HNSW index exists (P2, A2).
-/// Chosen from the measurement in `verification/c2/`.
-pub const EXACT_SCAN_MAX_ITEMS: usize = 2000;
+/// Size below which the knowledge base is searched with the exact scan and no HNSW index is
+/// built (P2, A2). Chosen from the measurement in `verification/c2/` (owner decision
+/// 2026-11-06): on all cores the exact scan stays near 1 ms up to 10,000 items, its recall is
+/// always 1.0, while HNSW recall on uniform data falls to 0.48 at 10,000 and building the
+/// index takes up to 30 s.
+pub const EXACT_SCAN_MAX_ITEMS: usize = 10_000;
 
 /// The central in-memory knowledge base with pluggable search backends.
 pub struct KnowledgeStore {
@@ -120,6 +123,8 @@ pub struct KnowledgeStore {
     generation: u64,
     /// How far the loaded vectors were from unit length before normalisation (A1).
     norm_report: NormReport,
+    /// Item count from which an HNSW index is used (default `EXACT_SCAN_MAX_ITEMS`).
+    exact_limit: usize,
 }
 
 /// Result of normalising a knowledge base at load (A1).
@@ -182,7 +187,14 @@ impl KnowledgeStore {
             hnsw: None,
             generation: 0,
             norm_report: NormReport::default(),
+            exact_limit: EXACT_SCAN_MAX_ITEMS,
         }
+    }
+
+    /// Change the item count from which an HNSW index is built and used (default
+    /// `EXACT_SCAN_MAX_ITEMS`). Takes effect at the next `build_index` and `search`.
+    pub fn set_exact_scan_limit(&mut self, items: usize) {
+        self.exact_limit = items;
     }
 
     /// Vector dimensionality of the loaded knowledge base (0 when nothing is loaded).
@@ -289,8 +301,19 @@ impl KnowledgeStore {
     ///
     /// **CPU-intensive** — call this inside `tokio::task::spawn_blocking`.
     pub fn build_index(&mut self) {
+        // P2: a knowledge base under the threshold is searched exactly, so there is nothing to build.
+        if !self.wants_index() {
+            self.hnsw = None;
+            return;
+        }
         // `&mut self` is held throughout, so the generation cannot change.
         self.hnsw = Some(self.index_job().build().index);
+    }
+
+    /// Whether this knowledge base is large enough for an HNSW index (`EXACT_SCAN_MAX_ITEMS`).
+    /// Under it, `build_index` does nothing and `search` scans exactly.
+    pub fn wants_index(&self) -> bool {
+        self.items.len() >= self.exact_limit
     }
 
     /// P1: hand out what an index build needs (a shared matrix, no copy), so the build can run
@@ -330,7 +353,7 @@ impl KnowledgeStore {
         let mut unit = query.vector.to_vec();
         normalise_row(&mut unit);
         let results = match &self.hnsw {
-            Some(hnsw) if self.items.len() >= EXACT_SCAN_MAX_ITEMS => {
+            Some(hnsw) if self.items.len() >= self.exact_limit => {
                 let ef = query.ef.unwrap_or_else(|| crate::hnsw_index::default_ef(top_k));
                 hnsw.search_with(&unit, top_k, ef)
                     .into_iter()
@@ -726,9 +749,9 @@ mod tests {
 
     #[test]
     fn p2_small_kb_uses_exact() {
-        // A small KB with an index built must answer exactly: every top-k equals the exact scan.
+        // Under the threshold nothing is built and every answer is the exact scan.
         let n = EXACT_SCAN_MAX_ITEMS - 1;
-        let dim = 16;
+        let dim = 8;
         let mut store = KnowledgeStore::new();
         let mut data = Vec::new();
         let mut items = Vec::new();
@@ -748,16 +771,58 @@ mod tests {
             items.push(SlimItem { id: Some(format!("i{i}")), metadata: serde_json::Map::new() });
         }
         store.install(items, VectorMatrix::from_flat(dim, data).unwrap(), NormReport::default());
+        assert!(!store.wants_index());
         store.build_index();
-        assert!(store.has_index());
+        assert!(!store.has_index(), "a small knowledge base builds no index");
         for q in 0..n.min(40) {
             let query = store.matrix.row(q).to_vec();
             let via_search: Vec<usize> = store.search(&query, 10).into_iter().map(|r| r.idx).collect();
             let exact: Vec<usize> = store.linear_search(&query, 10).into_iter().map(|r| r.idx).collect();
             assert_eq!(via_search, exact);
         }
-        // Above the threshold the index answers (checked by the type of path, not by recall).
-        assert!(n < EXACT_SCAN_MAX_ITEMS);
+    }
+
+    #[test]
+    fn p2_large_kb_builds_and_uses_the_index() {
+        // At the threshold the index is built and answers; each stored vector finds itself first.
+        let limit = 400; // a small limit keeps the debug-build test fast
+        let n = limit;
+        let dim = 8;
+        let mut data = Vec::with_capacity(n * dim);
+        let mut items = Vec::with_capacity(n);
+        let mut x = 0x9E37_79B9_7F4A_7C15u64;
+        for i in 0..n {
+            let mut row: Vec<f32> = (0..dim)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect();
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            row.iter_mut().for_each(|v| *v /= norm);
+            data.extend(row);
+            items.push(SlimItem { id: Some(format!("i{i}")), metadata: serde_json::Map::new() });
+        }
+        let mut store = KnowledgeStore::new();
+        store.set_exact_scan_limit(limit);
+        store.install(items, VectorMatrix::from_flat(dim, data).unwrap(), NormReport::default());
+        assert!(store.wants_index());
+        store.build_index();
+        assert!(store.has_index());
+        let hits = (0..n)
+            .filter(|&q| {
+                let query = store.matrix.row(q).to_vec();
+                store.search(&query, 1).first().is_some_and(|r| r.idx == q)
+            })
+            .count();
+        assert!(hits >= n * 97 / 100, "the index found itself for {hits}/{n} stored vectors");
+        // The same store with the default limit scans exactly and builds nothing.
+        store.set_exact_scan_limit(EXACT_SCAN_MAX_ITEMS);
+        assert!(!store.wants_index());
+        store.build_index();
+        assert!(!store.has_index());
     }
 
     #[test]

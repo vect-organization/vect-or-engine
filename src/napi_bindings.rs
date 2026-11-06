@@ -239,6 +239,10 @@ pub async fn build_index() -> Result<u32> {
         if engine.knowledge_store.is_empty() {
             return Err(Error::new(Status::GenericFailure, "Knowledge base is empty."));
         }
+        // P2: a small knowledge base is searched exactly; there is no index to build.
+        if !engine.knowledge_store.wants_index() {
+            return Ok(engine.knowledge_store.len() as u32);
+        }
         engine.knowledge_store.index_job()
     };
     let built = tokio::task::spawn_blocking(move || job.build())

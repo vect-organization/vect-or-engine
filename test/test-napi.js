@@ -46,7 +46,8 @@ async function testKnowledgeStore() {
     const info = await kbInfo();
     assert.strictEqual(info.count, 3);
     assert.strictEqual(info.dim, 3);
-    assert.strictEqual(info.hnswReady, true);
+    // P2: a knowledge base under 10,000 items is searched exactly and builds no index.
+    assert.strictEqual(info.hnswReady, false);
     // A1: vec-1 has length 0.927, so one vector is rescaled and the deviation is reported.
     assert.strictEqual(info.rescaledCount, 1);
     assert(Math.abs(info.maxNormDeviation - 0.0725) < 0.001, `deviation ${info.maxNormDeviation}`);

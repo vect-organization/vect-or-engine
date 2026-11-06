@@ -40,9 +40,9 @@ export interface JsKbInfo {
   count: number
   dim: number
   hnswReady: boolean
-  /** Largest | norm - 1 | of the loaded vectors, measured before normalisation (A1). */
+  /** Largest `| ||v|| - 1 |` over the loaded vectors, measured before they were normalised (A1). */
   maxNormDeviation: number
-  /** Number of vectors rescaled to unit length at load (A1). */
+  /** Number of vectors that were rescaled to unit length at load (A1). */
   rescaledCount: number
 }
 /** Validates a document using the currently loaded profile. */
