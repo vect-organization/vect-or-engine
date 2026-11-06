@@ -335,7 +335,7 @@ fn main() {
 
     let _ = writeln!(
         report,
-        "\nNotes\n- Memory columns are the vector payload only (N x {dim} x 4 or x 2 bytes); graph and process memory are not measured\n- `exact scan` is a single-thread f32 scan, not the rayon `KnowledgeStore::linear_search`\n- Keyword rules are matched rule by rule (no shared automaton); only conflict items use Aho-Corasick, and that path is not measured here"
+        "\nNotes\n- Memory columns are the vector payload only (N x {dim} x 4 or x 2 bytes); graph and process memory are not measured\n- `exact scan` is a single-thread f32 scan, not the rayon `KnowledgeStore::linear_search`\n- Keyword trigger words share one Aho-Corasick pass (literals) and one RegexSet pass (regexes) since change-log P6; conflict items use their own Aho-Corasick and are not measured here. Earlier per-trigger numbers: verification/validator/p6_bench.md"
     );
 
     print!("{report}");

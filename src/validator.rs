@@ -5,9 +5,10 @@
 #![forbid(unsafe_code)]
 
 use crate::profile::Profile;
-use aho_corasick::AhoCorasick;
+use aho_corasick::{AhoCorasick, MatchKind};
 use crate::limits::MAX_REGEX_SIZE;
-use regex::{Regex, RegexBuilder};
+use regex::{Regex, RegexBuilder, RegexSet, RegexSetBuilder};
+use std::collections::HashMap;
 use serde::{Deserialize, Serialize};
 
 #[derive(Debug, Clone, Serialize, Deserialize)]
@@ -59,7 +60,10 @@ enum Matcher {
 }
 
 impl Matcher {
-    fn compile(word: &str, mode: MatchMode) -> Result<Self, String> {
+    fn compile(word: &str, mode: MatchMode, normalize: bool) -> Result<Self, String> {
+        // Literal words are folded like the text when A6 normalization is on; regexes are not
+        // rewritten (write them against the folded text).
+        let literal = if normalize { normalize_with_offsets(word).0 } else { word.to_string() };
         let regex = || {
             RegexBuilder::new(word)
                 .size_limit(MAX_REGEX_SIZE)
@@ -67,18 +71,19 @@ impl Matcher {
                 .map_err(|e| format!("invalid regex '{word}' in keyword rule: {e}"))
         };
         Ok(match mode {
-            MatchMode::Literal => Matcher::Literal(word.to_string()),
+            MatchMode::Literal => Matcher::Literal(literal),
             MatchMode::Regex => Matcher::Regex(regex()?),
             // `both` must not reject a word that is only a valid literal (e.g. "C++", "("):
             // if it is not a valid regex, it simply matches as literal text.
             MatchMode::Both => match regex() {
-                Ok(re) => Matcher::Both(word.to_string(), re),
-                Err(_) => Matcher::Literal(word.to_string()),
+                Ok(re) => Matcher::Both(literal, re),
+                Err(_) => Matcher::Literal(literal),
             },
         })
     }
 
     /// Byte offset of the first match, if any. Used for the marker's line number.
+    #[cfg(test)]
     fn find(&self, text: &str) -> Option<usize> {
         match self {
             Matcher::Literal(s) => text.find(s.as_str()),
@@ -95,9 +100,75 @@ impl Matcher {
     }
 }
 
+/// A trigger word plus its slots in the shared index.
+struct IndexedMatcher {
+    matcher: Matcher,
+    /// Pattern id in the shared Aho-Corasick automaton (literal side).
+    lit_id: Option<usize>,
+    /// Index in the shared `RegexSet` (regex side).
+    re_id: Option<usize>,
+}
+
 struct CompiledKeywordRule {
     warning_message: String,
-    matchers: Vec<Matcher>,
+    matchers: Vec<IndexedMatcher>,
+}
+
+/// One Aho-Corasick pass for all literal trigger words and one `RegexSet` pass for all regex
+/// trigger words (change-log P6), instead of one full-text scan per word.
+struct KeywordIndex {
+    ac: Option<AhoCorasick>,
+    set: Option<RegexSet>,
+}
+
+/// Presence of every indexed word in one text, plus where each literal first occurs.
+struct KeywordScan {
+    lit_first: Vec<Option<usize>>,
+    re_present: Vec<bool>,
+}
+
+impl KeywordIndex {
+    fn scan(&self, text: &str) -> KeywordScan {
+        let mut lit_first = Vec::new();
+        if let Some(ac) = &self.ac {
+            lit_first = vec![None; ac.patterns_len()];
+            for m in ac.find_overlapping_iter(text) {
+                let slot = &mut lit_first[m.pattern().as_usize()];
+                if slot.is_none_or(|s| m.start() < s) {
+                    *slot = Some(m.start());
+                }
+            }
+        }
+        let mut re_present = Vec::new();
+        if let Some(set) = &self.set {
+            re_present = vec![false; set.len()];
+            for i in set.matches(text).iter() {
+                re_present[i] = true;
+            }
+        }
+        KeywordScan { lit_first, re_present }
+    }
+}
+
+impl IndexedMatcher {
+    fn present(&self, scan: &KeywordScan) -> bool {
+        self.lit_id.is_some_and(|i| scan.lit_first[i].is_some())
+            || self.re_id.is_some_and(|i| scan.re_present[i])
+    }
+
+    /// First match offset; the literal side comes from the scan, a regex runs once on demand
+    /// (only for the first trigger word of a rule that fired).
+    fn first_offset(&self, scan: &KeywordScan, text: &str) -> Option<usize> {
+        let lit = self.lit_id.and_then(|i| scan.lit_first[i]);
+        let rx = match &self.matcher {
+            Matcher::Regex(re) | Matcher::Both(_, re) => re.find(text).map(|m| m.start()),
+            Matcher::Literal(_) => None,
+        };
+        match (lit, rx) {
+            (Some(a), Some(b)) => Some(a.min(b)),
+            (a, b) => a.or(b),
+        }
+    }
 }
 
 pub struct Validator {
@@ -107,6 +178,48 @@ pub struct Validator {
     conflict_item_reasons: Vec<String>,
     min_value: u32,
     keyword_rules: Vec<CompiledKeywordRule>,
+    keyword_index: KeywordIndex,
+    /// A6: match against NFKC-normalized, lower-cased text (offsets map back to the original).
+    normalize: bool,
+}
+
+/// NFKC-normalizes and lower-cases `text` and returns it with an offset map: entry `i` is the
+/// byte offset in `text` of the original character that produced byte `i` of the result, and
+/// the last entry is `text.len()` (change-log A6). A starter character and the combining marks
+/// that follow it are normalized together, so "か" + "゛" composes to "が" and maps to the
+/// starter's offset. Composition across two starters (Hangul jamo) is not attempted.
+pub fn normalize_with_offsets(text: &str) -> (String, Vec<usize>) {
+    use unicode_normalization::{char::canonical_combining_class, UnicodeNormalization};
+    let mut out = String::with_capacity(text.len());
+    let mut map: Vec<usize> = Vec::with_capacity(text.len() + 1);
+    let mut chunk = String::new();
+    let mut chunk_start = 0usize;
+    let flush = |chunk: &mut String, start: usize, out: &mut String, map: &mut Vec<usize>| {
+        for c in chunk.chars().nfkc().flat_map(|c| c.to_lowercase()) {
+            out.push(c);
+            map.extend(std::iter::repeat_n(start, c.len_utf8()));
+        }
+        chunk.clear();
+    };
+    for (i, ch) in text.char_indices() {
+        let continues = ch
+            .to_string()
+            .nfkc()
+            .next()
+            .is_some_and(|f| canonical_combining_class(f) != 0);
+        if !continues {
+            flush(&mut chunk, chunk_start, &mut out, &mut map);
+            chunk_start = i;
+        }
+        chunk.push(ch);
+    }
+    flush(&mut chunk, chunk_start, &mut out, &mut map);
+    map.push(text.len());
+    (out, map)
+}
+
+fn fold_text(s: &str) -> String {
+    normalize_with_offsets(s).0
 }
 
 impl Validator {
@@ -119,12 +232,23 @@ impl Validator {
     /// Builds the validator with the given keyword matching mode. Fails on an invalid regex,
     /// so the caller can keep the previously loaded rules.
     pub fn with_mode(profile: &Profile, mode: MatchMode) -> Result<Self, String> {
+        Self::with_options(profile, mode, false)
+    }
+
+    /// Like `with_mode`, with the opt-in A6 text normalization: the document and the literal
+    /// words are NFKC-normalized and lower-cased before matching, so full-width codes and
+    /// upper/lower case variants hit. Marker lines still refer to the original text. Regex words
+    /// are used as written, so write them against the folded text.
+    pub fn with_options(profile: &Profile, mode: MatchMode, normalize: bool) -> Result<Self, String> {
         let mut patterns = Vec::new();
         let mut reasons = Vec::new();
         let mut min_value = 0;
         let mut value_regex = None;
         let mut value_warning_template = None;
         let mut keyword_rules = Vec::new();
+        let mut lit_words: Vec<String> = Vec::new();
+        let mut lit_index: HashMap<String, usize> = HashMap::new();
+        let mut re_words: Vec<String> = Vec::new();
 
         if let Some(rules) = &profile.assessment_rules {
             if let Some(template) = &rules.document_template {
@@ -145,8 +269,8 @@ impl Validator {
                     }
                     if let Some(conflicts) = &reqs.conflict_items {
                         for cd in conflicts {
-                            patterns.push(cd.item_code.clone());
-                            patterns.push(cd.name.clone());
+                            patterns.push(if normalize { fold_text(&cd.item_code) } else { cd.item_code.clone() });
+                            patterns.push(if normalize { fold_text(&cd.name) } else { cd.name.clone() });
                             reasons.push(format!("{}: {}", cd.name, cd.reason));
                             reasons.push(format!("{}: {}", cd.name, cd.reason));
                         }
@@ -158,8 +282,28 @@ impl Validator {
                     let matchers = rule
                         .trigger_words
                         .iter()
-                        .map(|w| Matcher::compile(w, mode))
-                        .collect::<Result<Vec<_>, _>>()?;
+                        .map(|w| {
+                            let matcher = Matcher::compile(w, mode, normalize)?;
+                            let (lit, has_re) = match &matcher {
+                                Matcher::Literal(s) => (Some(s.as_str()), false),
+                                Matcher::Regex(_) => (None, true),
+                                Matcher::Both(s, _) => (Some(s.as_str()), true),
+                            };
+                            let lit_id = lit.map(|s| match lit_index.get(s) {
+                                Some(&id) => id,
+                                None => {
+                                    lit_words.push(s.to_string());
+                                    lit_index.insert(s.to_string(), lit_words.len() - 1);
+                                    lit_words.len() - 1
+                                }
+                            });
+                            let re_id = has_re.then(|| {
+                                re_words.push(w.clone());
+                                re_words.len() - 1
+                            });
+                            Ok(IndexedMatcher { matcher, lit_id, re_id })
+                        })
+                        .collect::<Result<Vec<_>, String>>()?;
                     keyword_rules.push(CompiledKeywordRule {
                         warning_message: rule.warning_message.clone(),
                         matchers,
@@ -169,12 +313,34 @@ impl Validator {
         }
 
         let conflict_items_ac = if !patterns.is_empty() {
-            AhoCorasick::builder().build(&patterns).ok()
+            AhoCorasick::builder().match_kind(MatchKind::LeftmostLongest).build(&patterns).ok()
         } else {
             None
         };
 
+        let kw_ac = if lit_words.is_empty() {
+            None
+        } else {
+            Some(
+                AhoCorasick::new(&lit_words)
+                    .map_err(|e| format!("cannot build the keyword automaton: {e}"))?,
+            )
+        };
+        // Every word was already compiled alone under MAX_REGEX_SIZE; the set limit is the sum.
+        let kw_set = if re_words.is_empty() {
+            None
+        } else {
+            Some(
+                RegexSetBuilder::new(&re_words)
+                    .size_limit(MAX_REGEX_SIZE.saturating_mul(re_words.len()))
+                    .build()
+                    .map_err(|e| format!("cannot build the keyword regex set: {e}"))?,
+            )
+        };
+
         Ok(Validator {
+            keyword_index: KeywordIndex { ac: kw_ac, set: kw_set },
+            normalize,
             value_regex,
             value_warning_template,
             conflict_items_ac,
@@ -184,14 +350,52 @@ impl Validator {
         })
     }
 
-    pub fn validate(&self, text: &str) -> ValidationResult {
+    /// Reference implementation of the keyword check before change-log P6: every trigger word
+    /// scans the whole text. Returns (rule index, first-trigger offset) for each rule that fires.
+    #[cfg(test)]
+    fn keyword_hits_per_trigger(&self, text: &str) -> Vec<(usize, Option<usize>)> {
+        self.keyword_rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.matchers.is_empty() && r.matchers.iter().all(|m| m.matcher.find(text).is_some()))
+            .map(|(i, r)| (i, r.matchers.first().and_then(|m| m.matcher.find(text))))
+            .collect()
+    }
+
+    /// Same result from the shared index (what `validate` uses).
+    #[cfg(test)]
+    fn keyword_hits_shared(&self, text: &str) -> Vec<(usize, Option<usize>)> {
+        let scan = self.keyword_index.scan(text);
+        self.keyword_rules
+            .iter()
+            .enumerate()
+            .filter(|(_, r)| !r.matchers.is_empty() && r.matchers.iter().all(|m| m.present(&scan)))
+            .map(|(i, r)| (i, r.matchers.first().and_then(|m| m.first_offset(&scan, text))))
+            .collect()
+    }
+
+    pub fn validate(&self, original: &str) -> ValidationResult {
+        // A6: with normalization on, all matching runs on the folded text and every offset is
+        // mapped back to the original before it becomes a line number.
+        let (folded, map) = if self.normalize {
+            let (t, m) = normalize_with_offsets(original);
+            (Some(t), Some(m))
+        } else {
+            (None, None)
+        };
+        let text: &str = folded.as_deref().unwrap_or(original);
+
         // Pre-compute line start offsets once, reused for all markers.
         let line_starts: Vec<usize> = std::iter::once(0)
-            .chain(text.char_indices().filter(|(_, c)| *c == '\n').map(|(i, _)| i + 1))
+            .chain(original.char_indices().filter(|(_, c)| *c == '\n').map(|(i, _)| i + 1))
             .collect();
 
-        // Map a byte offset to a 1-based line number.
+        // Map a byte offset (in the matched text) to a 1-based line number of the original.
         let offset_to_line = |offset: usize| -> u32 {
+            let offset = match &map {
+                Some(m) => m[offset.min(m.len() - 1)],
+                None => offset,
+            };
             line_starts.partition_point(|&s| s <= offset) as u32
         };
 
@@ -244,15 +448,16 @@ impl Validator {
             }
         }
 
-        // 3. Keyword Rule Check (Dynamic)
+        // 3. Keyword Rule Check (Dynamic): one shared scan, then a lookup per rule (P6).
+        let scan = self.keyword_index.scan(text);
         for rule in &self.keyword_rules {
-            if !rule.matchers.is_empty() && rule.matchers.iter().all(|m| m.find(text).is_some()) {
+            if !rule.matchers.is_empty() && rule.matchers.iter().all(|m| m.present(&scan)) {
                 has_keyword_conflict = true;
                 let msg = rule.warning_message.clone();
                 keyword_message = Some(msg.clone());
                 // Find the line of the first trigger word.
                 let line = rule.matchers.first()
-                    .and_then(|m| m.find(text))
+                    .and_then(|m| m.first_offset(&scan, text))
                     .map(&offset_to_line)
                     .unwrap_or(1);
                 markers.push(ValidationMarker {
@@ -391,6 +596,93 @@ mod tests {
         let paren = Validator::with_mode(&keyword_profile("("), MatchMode::Both)
             .expect("both mode must accept a lone parenthesis");
         assert!(paren.validate("see (note)").has_keyword_conflict);
+    }
+
+    #[test]
+    fn p6_shared_index_matches_per_trigger_scan() {
+        // Single and multi-trigger rules, overlapping and repeated literals, regex words,
+        // and a word that is only a valid literal.
+        let json = r#"{"assessment_rules":{"keyword_rules":[
+            {"trigger_words":["abc"],"warning_message":"r0"},
+            {"trigger_words":["bc","a.c"],"warning_message":"r1"},
+            {"trigger_words":["G\\d+","note"],"warning_message":"r2"},
+            {"trigger_words":["C++"],"warning_message":"r3"},
+            {"trigger_words":["abc","zzz"],"warning_message":"r4"},
+            {"trigger_words":["x\\s+y"],"warning_message":"r5"}
+        ]}}"#;
+        let profile = Profile::load_from_json_str(json).unwrap();
+        let texts = [
+            "",
+            "abc",
+            "xxabcabc\nnote G42",
+            "a.c and bc here",
+            "line1\nline2\nG7 note\nabc",
+            "we use C++ and abc; zzz",
+            "x   y",
+            "日本語 abc ひらがな\nG1 note",
+            "bcabc",
+        ];
+        let mut compared = 0;
+        for mode in [MatchMode::Literal, MatchMode::Regex, MatchMode::Both] {
+            // Every word here compiles in all three modes ("C++" is a valid repetition).
+            let Ok(v) = Validator::with_mode(&profile, mode) else { continue };
+            for t in texts {
+                assert_eq!(v.keyword_hits_per_trigger(t), v.keyword_hits_shared(t), "mode {mode:?}, text {t:?}");
+                compared += 1;
+            }
+        }
+        assert_eq!(compared, 3 * texts.len());
+    }
+
+    #[test]
+    fn d5_longest_code_reported() {
+        // F20 and F20.0 both start at the same position; the longer code must win.
+        // (Before D5 the Standard match kind reported the earlier-listed F20 and hid F20.0.)
+        let json = r#"{"assessment_rules":{"document_template":{"numerical_requirements":{
+            "conflict_items":[
+                {"item_code":"F20","name":"Schizophrenia","reason":"broad"},
+                {"item_code":"F20.0","name":"Paranoid schizophrenia","reason":"specific"}
+            ]}}}}"#;
+        let v = Validator::new(&Profile::load_from_json_str(json).unwrap()).unwrap();
+        let res = v.validate("diagnosis F20.0 recorded");
+        assert_eq!(res.markers.len(), 1, "{:?}", res.markers);
+        assert!(res.markers[0].message.contains("specific"), "{:?}", res.markers);
+        // The shorter code still reports on its own.
+        let res = v.validate("diagnosis F20 recorded");
+        assert_eq!(res.markers.len(), 1);
+        assert!(res.markers[0].message.contains("broad"));
+    }
+
+    #[test]
+    fn a6_nfkc_option_maps_offsets() {
+        // Offset map: full-width letters, a half-width kana with its dakuten mark, and case.
+        let src = "Ａb\nｶﾞ";
+        let (norm, map) = normalize_with_offsets(src);
+        assert_eq!(norm, "ab\nガ");
+        assert_eq!(map.len(), norm.len() + 1);
+        assert_eq!(map[0], 0); // "a" comes from "Ａ" at byte 0
+        assert_eq!(map[1], 3); // "b" at byte 3
+        assert_eq!(map[2], 4); // newline
+        assert_eq!(map[3], 5); // "ガ" starts at the kana "ｶ"
+        assert_eq!(map[5], 5); // all three bytes of "ガ" map to the starter
+        assert_eq!(*map.last().unwrap(), src.len());
+
+        // Default stays unchanged: a full-width code does not hit; with the option it does,
+        // and the marker line is the line of the original text.
+        let profile = keyword_profile("f20");
+        let text = "intro\nsecond\nコード Ｆ２０ です";
+        let plain = Validator::with_mode(&profile, MatchMode::Literal).unwrap();
+        assert!(!plain.validate(text).has_keyword_conflict);
+        let folded = Validator::with_options(&profile, MatchMode::Literal, true).unwrap();
+        let res = folded.validate(text);
+        assert!(res.has_keyword_conflict);
+        assert_eq!(res.markers[0].line, 3);
+        // Words are folded too: an upper-case full-width trigger word matches ASCII text.
+        let wide = Validator::with_options(&keyword_profile("ＡＢＣ"), MatchMode::Literal, true).unwrap();
+        assert!(wide.validate("x\nabc").has_keyword_conflict);
+        // Pure lower-case ASCII maps one to one.
+        let (n, m) = normalize_with_offsets("abc");
+        assert_eq!((n.as_str(), m), ("abc", vec![0, 1, 2, 3]));
     }
 
     #[test]
