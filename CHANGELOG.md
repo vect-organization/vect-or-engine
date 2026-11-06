@@ -30,7 +30,7 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ## [0.3.13] - 2026-11-06
 
-Phase F of the 0.4.0 work (gates). Change-log rows: `docs/changes/v0.4.0.csv` (R3, S5, S8, S9; S5 and S8 close after their first CI run, S9 waits for an owner decision).
+Phase F of the 0.4.0 work (gates). Change-log rows: `docs/changes/v0.4.0.csv` (R3, S5, S8, S9; S9 waits for an owner decision).
 
 ### Changed
 - **R3**: `build.rs` uses `SOURCE_DATE_EPOCH` for the embedded build time when it is a valid integer, so two builds of the same source give the same binary. `node scripts/check-reproducible-build.mjs` builds twice and compares SHA-256 (on MSVC it adds `/Brepro` for the check only; the normal build is unchanged). Result on Windows: identical
