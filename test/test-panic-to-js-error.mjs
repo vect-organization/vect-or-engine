@@ -1,4 +1,4 @@
-// Change-log S5: a Rust panic in a synchronous export reaches JavaScript as an Error and the
+// Change-log S5 (proof: s5_panic_becomes_js_error): a Rust panic in a synchronous export reaches JavaScript as an Error and the
 // host process keeps running. Builds the library with the `test-hooks` feature (which adds an
 // export that panics on purpose), loads it as a .node file, and calls it.
 // Usage: node --test test/test-panic-to-js-error.mjs   (slow: it runs cargo build)
@@ -12,7 +12,7 @@ import { join } from 'node:path';
 
 const LIB = { win32: 'vect_or_engine.dll', darwin: 'libvect_or_engine.dylib' }[process.platform] ?? 'libvect_or_engine.so';
 
-test('a forced panic becomes a JS error and the process survives', () => {
+test('s5_panic_becomes_js_error: a forced panic becomes a JS error and the process survives', () => {
   const r = spawnSync('cargo', ['build', '--lib', '--features', 'test-hooks'], { stdio: 'inherit', shell: process.platform === 'win32' });
   assert.equal(r.status, 0, 'cargo build failed');
   const node = join(mkdtempSync(join(tmpdir(), 'vect-s5-')), 'engine.node');

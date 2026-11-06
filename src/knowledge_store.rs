@@ -629,10 +629,14 @@ mod tests {
 
             let items = (0..n).map(|i| SlimItem { id: Some(format!("i{i}")), metadata: serde_json::Map::new() }).collect();
             let mut store = KnowledgeStore::new();
-            store.install(items, VectorMatrix::from_flat(dim, data.clone()).unwrap());
+            store.install(items, VectorMatrix::from_flat(dim, data.clone()).unwrap(), NormReport::default());
 
+            // Since A1 the store scores cosine similarity: the query is brought to unit length
+            // first (the rows are already used as given, because `install` skips the load step).
+            let mut unit_query = query.clone();
+            normalise_row(&mut unit_query);
             let mut expected: Vec<(f32, usize)> =
-                (0..n).map(|i| (dot(&query, &data[i * dim..(i + 1) * dim]), i)).collect();
+                (0..n).map(|i| (dot(&unit_query, &data[i * dim..(i + 1) * dim]), i)).collect();
             expected.sort_by(|a, b| b.0.total_cmp(&a.0).then(a.1.cmp(&b.1)));
             expected.truncate(top_k);
 

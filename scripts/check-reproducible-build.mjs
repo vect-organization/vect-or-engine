@@ -1,7 +1,7 @@
-// Change-log R3: with SOURCE_DATE_EPOCH set, two builds of the same source give the same binary.
+// Change-log R3 (proof: check_reproducible_build): with SOURCE_DATE_EPOCH set, two builds of the same source give the same binary.
 // Builds the library with the `napi` feature (the only build that embeds the build time) twice,
 // forcing build.rs to rerun in between, and compares the SHA-256 of the result.
-// Usage: node verification/check-reproducible-build.mjs   (run from the repository root)
+// Usage: node scripts/check-reproducible-build.mjs   (run from the repository root)
 // On MSVC the linker stamps the build time into the PE header unless /Brepro is given, so the
 // script adds it for this check only. It does not change the normal build.
 import { spawnSync } from 'node:child_process';
