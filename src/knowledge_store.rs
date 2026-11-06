@@ -14,6 +14,7 @@
 //!  4. **HnswIndex**      — O(log N) approximate search for large datasets.
 //!  5. **SQLite cache**   — avoids re-parsing JSON on every restart.
 
+#[cfg(feature = "cache")]
 use half::f16;
 use rayon::prelude::*;
 use serde::{Deserialize, Serialize};
@@ -24,6 +25,56 @@ use crate::limits::{F16_MAX_ABS, MAX_KB_BYTES, MAX_TOP_K};
 use crate::matrix::{dot, VectorMatrix};
 
 use crate::engine_error::EngineError;
+
+/// Version of the SQLite cache layout (R4). Bump it when the table layout or the hash changes.
+#[cfg(feature = "cache")]
+const CACHE_FORMAT_VERSION: u32 = 1;
+
+#[cfg(not(feature = "cache"))]
+const NO_CACHE: &str = "this build has no SQLite cache support (cargo feature `cache`)";
+
+/// 64-bit FNV-1a over the rows of a cache, in order; detects a cache whose rows were edited or
+/// truncated after it was written. It is a consistency check, not a defence against an attacker.
+#[cfg(feature = "cache")]
+mod cache_hash {
+    pub fn new() -> u64 {
+        0xcbf2_9ce4_8422_2325
+    }
+
+    fn feed(h: &mut u64, bytes: &[u8]) {
+        for &b in bytes {
+            *h ^= u64::from(b);
+            *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+        }
+        // A separator keeps ("ab","c") apart from ("a","bc").
+        *h ^= 0xff;
+        *h = h.wrapping_mul(0x0000_0100_0000_01b3);
+    }
+
+    pub fn feed_row(h: &mut u64, id: Option<&str>, metadata: &str, blob: &[u8]) {
+        feed(h, &[u8::from(id.is_some())]);
+        feed(h, id.unwrap_or("").as_bytes());
+        feed(h, metadata.as_bytes());
+        feed(h, blob);
+    }
+}
+
+#[cfg(feature = "cache")]
+fn read_cache_meta(conn: &rusqlite::Connection) -> Result<Vec<(String, String)>, EngineError> {
+    let has_meta: bool = conn
+        .query_row("SELECT count(*) > 0 FROM sqlite_master WHERE type = 'table' AND name = 'kb_meta'", [], |r| r.get(0))
+        .map_err(|e| EngineError::Database(e.to_string()))?;
+    if !has_meta {
+        return Ok(Vec::new());
+    }
+    let mut stmt = conn
+        .prepare("SELECT key, value FROM kb_meta")
+        .map_err(|e| EngineError::Database(e.to_string()))?;
+    let rows = stmt
+        .query_map([], |r| Ok((r.get::<_, String>(0)?, r.get::<_, String>(1)?)))
+        .map_err(|e| EngineError::Database(e.to_string()))?;
+    rows.collect::<Result<Vec<_>, _>>().map_err(|e| EngineError::Database(e.to_string()))
+}
 use crate::hnsw_index::{HnswIndex, HnswParams};
 
 // ─── Public data types ────────────────────────────────────────────────────────
@@ -241,8 +292,23 @@ impl KnowledgeStore {
             )));
         }
         let bytes = fs::read(path)?;
+        self.load_from_bytes(&bytes)
+    }
 
-        let raw: Vec<KnowledgeItem> = serde_json::from_slice(&bytes)?;
+    /// Load the same JSON from memory, without a file (P8). The size limit is the same as for a
+    /// file. On any error the previous knowledge base is kept.
+    pub fn load_from_json(&mut self, json: &str) -> Result<usize, EngineError> {
+        if json.len() as u64 > MAX_KB_BYTES {
+            return Err(EngineError::InvalidInput(format!(
+                "knowledge base is {} bytes, larger than the {MAX_KB_BYTES} byte limit",
+                json.len()
+            )));
+        }
+        self.load_from_bytes(json.as_bytes())
+    }
+
+    fn load_from_bytes(&mut self, bytes: &[u8]) -> Result<usize, EngineError> {
+        let raw: Vec<KnowledgeItem> = serde_json::from_slice(bytes)?;
         let count = raw.len();
 
         // D12: an empty file is an error, not a silent no-op that leaves the old KB in place.
@@ -410,51 +476,95 @@ impl KnowledgeStore {
             .collect()
     }
 
-    // ── SQLite persistence ────────────────────────────────────────────────────
+    // ── SQLite cache (cargo feature `cache`) ──────────────────────────────────
 
-    /// Persist the current knowledge base to a SQLite database. Vectors are written as f16, so
-    /// a knowledge base loaded back from the cache scores slightly differently from the JSON
-    /// it came from.
-    ///
-    /// Subsequent startups can call `load_from_sqlite` for faster startup
-    /// (avoids re-parsing the JSON file).
+    /// Persist the knowledge base to a SQLite cache without a model id. See
+    /// [`save_to_sqlite_with`](Self::save_to_sqlite_with).
     pub fn save_to_sqlite(&self, db_path: &str) -> Result<(), EngineError> {
-        let conn = rusqlite::Connection::open(db_path)
-            .map_err(|e| EngineError::Database(e.to_string()))?;
+        self.save_to_sqlite_with(db_path, None)
+    }
 
-        conn.execute_batch("
-            CREATE TABLE IF NOT EXISTS kb_items (
+    /// Load a SQLite cache without a model id check. See
+    /// [`load_from_sqlite_with`](Self::load_from_sqlite_with).
+    pub fn load_from_sqlite(&mut self, db_path: &str) -> Result<usize, EngineError> {
+        self.load_from_sqlite_with(db_path, None)
+    }
+
+    /// Persist the current knowledge base to a SQLite cache. Vectors are written as f16, so a
+    /// knowledge base loaded back from the cache scores slightly differently from the JSON it
+    /// came from.
+    ///
+    /// P7: the cache is written to a temporary file in one transaction and renamed over
+    /// `db_path`, so a crash leaves the old cache or none, never a partial one.
+    /// R4: the cache carries a header (format version, dimension, item count, a hash of the
+    /// content and, when given, the embedding model id) that `load_from_sqlite_with` checks.
+    #[cfg(feature = "cache")]
+    pub fn save_to_sqlite_with(&self, db_path: &str, model_id: Option<&str>) -> Result<(), EngineError> {
+        use std::sync::atomic::{AtomicU64, Ordering};
+        static COUNTER: AtomicU64 = AtomicU64::new(0);
+        let tmp = format!("{db_path}.tmp-{}-{}", std::process::id(), COUNTER.fetch_add(1, Ordering::Relaxed));
+        let _ = fs::remove_file(&tmp);
+        let result = self.write_cache_file(&tmp, model_id).and_then(|()| {
+            fs::rename(&tmp, db_path).map_err(|e| EngineError::Database(format!("cannot replace the cache: {e}")))
+        });
+        if result.is_err() {
+            let _ = fs::remove_file(&tmp);
+        }
+        result
+    }
+
+    #[cfg(feature = "cache")]
+    fn write_cache_file(&self, path: &str, model_id: Option<&str>) -> Result<(), EngineError> {
+        let db = |e: rusqlite::Error| EngineError::Database(e.to_string());
+        let mut conn = rusqlite::Connection::open(path).map_err(db)?;
+        let tx = conn.transaction().map_err(db)?;
+        tx.execute_batch(
+            "CREATE TABLE kb_items (
                 idx       INTEGER PRIMARY KEY,
                 id        TEXT,
                 metadata  TEXT NOT NULL,
                 vector_f16 BLOB NOT NULL
             );
-            DELETE FROM kb_items;
-        ")
-        .map_err(|e| EngineError::Database(e.to_string()))?;
-
-        let mut stmt = conn.prepare(
-            "INSERT INTO kb_items (idx, id, metadata, vector_f16) VALUES (?1,?2,?3,?4)"
-        ).map_err(|e| EngineError::Database(e.to_string()))?;
-
-        for (i, item) in self.items.iter().enumerate() {
-            let metadata_json = serde_json::to_string(&item.metadata)?;
-            // The cache format is f16, little-endian (the runtime copy stays exact f32).
-            let blob: Vec<u8> = self
-                .matrix
-                .row(i)
-                .iter()
-                .flat_map(|&x| f16::from_f32(x).to_le_bytes())
-                .collect();
-            stmt.execute(rusqlite::params![i as i64, item.id, metadata_json, blob])
-                .map_err(|e| EngineError::Database(e.to_string()))?;
+            CREATE TABLE kb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);",
+        )
+        .map_err(db)?;
+        let mut hash = cache_hash::new();
+        {
+            let mut stmt = tx
+                .prepare("INSERT INTO kb_items (idx, id, metadata, vector_f16) VALUES (?1,?2,?3,?4)")
+                .map_err(db)?;
+            for (i, item) in self.items.iter().enumerate() {
+                let metadata_json = serde_json::to_string(&item.metadata)?;
+                // The cache format is f16, little-endian (the runtime copy stays exact f32).
+                let blob: Vec<u8> = self
+                    .matrix
+                    .row(i)
+                    .iter()
+                    .flat_map(|&x| f16::from_f32(x).to_le_bytes())
+                    .collect();
+                cache_hash::feed_row(&mut hash, item.id.as_deref(), &metadata_json, &blob);
+                stmt.execute(rusqlite::params![i as i64, item.id, metadata_json, blob]).map_err(db)?;
+            }
         }
-
-        Ok(())
+        let put = |k: &str, v: String| tx.execute("INSERT INTO kb_meta (key, value) VALUES (?1, ?2)", rusqlite::params![k, v]);
+        put("format_version", CACHE_FORMAT_VERSION.to_string()).map_err(db)?;
+        put("dim", self.matrix.dim().to_string()).map_err(db)?;
+        put("count", self.items.len().to_string()).map_err(db)?;
+        put("content_hash", format!("{hash:016x}")).map_err(db)?;
+        if let Some(m) = model_id {
+            put("model_id", m.to_string()).map_err(db)?;
+        }
+        tx.commit().map_err(db)?;
+        conn.close().map_err(|(_, e)| db(e))
     }
 
-    /// Load knowledge base from a SQLite cache (fast restart path).
-    pub fn load_from_sqlite(&mut self, db_path: &str) -> Result<usize, EngineError> {
+    /// Load a knowledge base from a SQLite cache (fast restart path).
+    ///
+    /// R4: the cache is rejected, and the previous knowledge base kept, when the header is
+    /// missing (a cache from an older version), has another format version, disagrees with the
+    /// rows (dimension, count, content hash), or names another model than `model_id`.
+    #[cfg(feature = "cache")]
+    pub fn load_from_sqlite_with(&mut self, db_path: &str, model_id: Option<&str>) -> Result<usize, EngineError> {
         // Read-only and never create: opening a missing path must not leave a new file behind.
         let conn = rusqlite::Connection::open_with_flags(
             db_path,
@@ -462,9 +572,26 @@ impl KnowledgeStore {
         )
         .map_err(|e| EngineError::Database(e.to_string()))?;
 
-        let mut stmt = conn.prepare(
-            "SELECT id, metadata, vector_f16 FROM kb_items ORDER BY idx"
-        ).map_err(|e| EngineError::Database(e.to_string()))?;
+        let meta = read_cache_meta(&conn)?;
+        let get = |k: &str| meta.iter().find(|(key, _)| key == k).map(|(_, v)| v.as_str());
+        let version = get("format_version")
+            .ok_or_else(|| EngineError::InvalidInput("the cache has no header (written by an older version); rebuild it".into()))?;
+        if version != CACHE_FORMAT_VERSION.to_string() {
+            return Err(EngineError::InvalidInput(format!(
+                "the cache has format version {version}, this engine reads {CACHE_FORMAT_VERSION}; rebuild it"
+            )));
+        }
+        if let (Some(want), Some(have)) = (model_id, get("model_id")) {
+            if want != have {
+                return Err(EngineError::InvalidInput(format!(
+                    "the cache was built with model '{have}', not '{want}'; rebuild it"
+                )));
+            }
+        }
+
+        let mut stmt = conn
+            .prepare("SELECT id, metadata, vector_f16 FROM kb_items ORDER BY idx")
+            .map_err(|e| EngineError::Database(e.to_string()))?;
 
         // D2: parse every row into locals, fail on the first bad one, and touch `self` only at
         // the end, so a bad cache neither skips rows silently nor keeps the previous dimension.
@@ -478,6 +605,7 @@ impl KnowledgeStore {
         let mut data: Vec<f32> = Vec::new();
         let mut dim = 0usize;
         let mut n = 0usize;
+        let mut hash = cache_hash::new();
         for row in &mut rows {
             let (id, meta_json, blob) = row.map_err(|e| EngineError::Database(format!("cache row #{n}: {e}")))?;
             if blob.is_empty() || blob.len() % 2 != 0 {
@@ -488,6 +616,7 @@ impl KnowledgeStore {
             }
             let metadata: serde_json::Map<String, serde_json::Value> = serde_json::from_str(&meta_json)
                 .map_err(|e| EngineError::InvalidInput(format!("cache row #{n} has invalid metadata: {e}")))?;
+            cache_hash::feed_row(&mut hash, id.as_deref(), &meta_json, &blob);
             let row: Vec<f32> = blob
                 .chunks_exact(2)
                 .map(|b| f16::from_le_bytes([b[0], b[1]]).to_f32())
@@ -508,10 +637,32 @@ impl KnowledgeStore {
         if n == 0 {
             return Err(EngineError::InvalidInput("the cache contains no items".into()));
         }
+        let check = |k: &str, got: String| -> Result<(), EngineError> {
+            match get(k) {
+                Some(v) if v == got => Ok(()),
+                other => Err(EngineError::InvalidInput(format!(
+                    "the cache header says {k} = {}, the rows give {got}; rebuild it",
+                    other.unwrap_or("(missing)")
+                ))),
+            }
+        };
+        check("dim", dim.to_string())?;
+        check("count", n.to_string())?;
+        check("content_hash", format!("{hash:016x}"))?;
 
         let report = normalise_all(dim, &mut data);
         self.install(items, VectorMatrix::from_flat(dim, data)?, report);
         Ok(n)
+    }
+
+    #[cfg(not(feature = "cache"))]
+    pub fn save_to_sqlite_with(&self, _db_path: &str, _model_id: Option<&str>) -> Result<(), EngineError> {
+        Err(EngineError::Database(NO_CACHE.into()))
+    }
+
+    #[cfg(not(feature = "cache"))]
+    pub fn load_from_sqlite_with(&mut self, _db_path: &str, _model_id: Option<&str>) -> Result<usize, EngineError> {
+        Err(EngineError::Database(NO_CACHE.into()))
     }
 
     // ── Internal helpers ──────────────────────────────────────────────────────
@@ -703,6 +854,7 @@ mod tests {
             .into_owned()
     }
 
+    #[cfg(feature = "cache")]
     #[test]
     fn d2_cache_load_resets_dim() {
         // A 4-dim KB is loaded first; a 2-dim cache must replace the dimension, not inherit it.
@@ -718,6 +870,7 @@ mod tests {
         std::fs::remove_file(db).ok();
     }
 
+    #[cfg(feature = "cache")]
     #[test]
     fn d2_cache_with_a_bad_row_fails_and_keeps_the_previous_kb() {
         let mut store = make_store(3, 4);
@@ -726,6 +879,8 @@ mod tests {
             let conn = rusqlite::Connection::open(&db).unwrap();
             conn.execute_batch(
                 "CREATE TABLE kb_items (idx INTEGER PRIMARY KEY, id TEXT, metadata TEXT NOT NULL, vector_f16 BLOB NOT NULL);
+                 CREATE TABLE kb_meta (key TEXT PRIMARY KEY, value TEXT NOT NULL);
+                 INSERT INTO kb_meta VALUES ('format_version', '1');
                  INSERT INTO kb_items VALUES (0, 'a', '{}', x'00380038');
                  INSERT INTO kb_items VALUES (1, 'b', '{}', x'003800');
                  INSERT INTO kb_items VALUES (2, 'c', '{}', x'0038');",
@@ -747,6 +902,99 @@ mod tests {
     }
 
     #[test]
+    fn p8_load_from_json_matches_load_from_path_and_keeps_the_old_kb_on_error() {
+        let text = r#"[{"id":"a","vector":[1.0,0.0]},{"id":"b","vector":[0.0,1.0]}]"#;
+        let path = write_kb(text);
+        let mut from_file = KnowledgeStore::new();
+        from_file.load_from_path(&path).unwrap();
+        let mut from_text = KnowledgeStore::new();
+        assert_eq!(from_text.load_from_json(text).unwrap(), 2);
+        let q = [0.6f32, 0.8];
+        let ids = |s: &KnowledgeStore| s.search(&q, 2).into_iter().map(|r| (r.idx, r.score.to_bits())).collect::<Vec<_>>();
+        assert_eq!(ids(&from_file), ids(&from_text));
+
+        let mut keep = make_store(3, 4);
+        assert!(keep.load_from_json("[]").is_err());
+        assert!(keep.load_from_json("not json").is_err());
+        assert_eq!(keep.len(), 3, "a failed load keeps the previous knowledge base");
+        std::fs::remove_file(path).ok();
+    }
+
+    #[cfg(feature = "cache")]
+    #[test]
+    fn p7_cache_save_is_atomic() {
+        let dir = std::env::temp_dir().join(format!("vect-p7-{}", std::process::id()));
+        std::fs::create_dir_all(&dir).unwrap();
+        let db = dir.join("kb.db").to_string_lossy().into_owned();
+        let store = make_store(5, 4);
+        store.save_to_sqlite(&db).unwrap();
+        // Saving again replaces the file; no temporary file stays behind.
+        make_store(7, 4).save_to_sqlite(&db).unwrap();
+        let names: Vec<String> = std::fs::read_dir(&dir).unwrap().map(|e| e.unwrap().file_name().to_string_lossy().into_owned()).collect();
+        assert_eq!(names, vec!["kb.db".to_string()], "only the cache itself remains");
+        let mut back = KnowledgeStore::new();
+        assert_eq!(back.load_from_sqlite(&db).unwrap(), 7);
+        // A save that fails leaves the old cache untouched and no temporary file.
+        let bad = dir.join("missing").join("kb.db").to_string_lossy().into_owned();
+        assert!(store.save_to_sqlite(&bad).is_err());
+        assert_eq!(std::fs::read_dir(&dir).unwrap().count(), 1);
+        std::fs::remove_dir_all(dir).ok();
+    }
+
+    #[cfg(feature = "cache")]
+    #[test]
+    fn r4_cache_header_mismatch_rejected() {
+        let db = cache_path("r4");
+        let src = make_store(4, 4);
+        src.save_to_sqlite_with(&db, Some("model-a")).unwrap();
+        let mut store = make_store(2, 4);
+        // The matching cache loads.
+        assert_eq!(store.load_from_sqlite_with(&db, Some("model-a")).unwrap(), 4);
+        // Another model id, or none stored, is handled as documented.
+        let mut keep = make_store(2, 4);
+        assert!(keep.load_from_sqlite_with(&db, Some("model-b")).is_err());
+        assert_eq!(keep.len(), 2, "a rejected cache keeps the previous knowledge base");
+        // Every header field is checked against the rows.
+        for (key, bad) in [("format_version", "99"), ("dim", "5"), ("count", "9"), ("content_hash", "0000000000000000")] {
+            let copy = cache_path(&format!("r4-{key}"));
+            std::fs::copy(&db, &copy).unwrap();
+            {
+                let conn = rusqlite::Connection::open(&copy).unwrap();
+                conn.execute("UPDATE kb_meta SET value = ?1 WHERE key = ?2", rusqlite::params![bad, key]).unwrap();
+            }
+            assert!(keep.load_from_sqlite(&copy).is_err(), "{key} mismatch must be rejected");
+            std::fs::remove_file(copy).ok();
+        }
+        // A row edited after the cache was written changes the hash.
+        let tampered = cache_path("r4-row");
+        std::fs::copy(&db, &tampered).unwrap();
+        {
+            let conn = rusqlite::Connection::open(&tampered).unwrap();
+            conn.execute("UPDATE kb_items SET id = 'other' WHERE idx = 0", []).unwrap();
+        }
+        assert!(keep.load_from_sqlite(&tampered).is_err());
+        // A cache without a header (written by an older version) is rejected.
+        {
+            let conn = rusqlite::Connection::open(&tampered).unwrap();
+            conn.execute_batch("DROP TABLE kb_meta;").unwrap();
+        }
+        let e = keep.load_from_sqlite(&tampered).unwrap_err().to_string();
+        assert!(e.contains("no header"), "{e}");
+        assert_eq!(keep.len(), 2);
+        std::fs::remove_file(tampered).ok();
+        std::fs::remove_file(db).ok();
+    }
+
+    #[cfg(not(feature = "cache"))]
+    #[test]
+    fn s3_without_the_cache_feature_the_cache_calls_fail_cleanly() {
+        let mut store = make_store(2, 4);
+        assert!(store.save_to_sqlite("x.db").unwrap_err().to_string().contains("cache"));
+        assert!(store.load_from_sqlite("x.db").unwrap_err().to_string().contains("cache"));
+        assert_eq!(store.len(), 2);
+    }
+
+    #[test]
     fn p1_index_built_off_lock_is_rejected_when_the_kb_was_reloaded() {
         let mut store = make_store(20, 4);
         let job = store.index_job();
@@ -765,9 +1013,14 @@ mod tests {
     }
 
     #[test]
-    fn s4_top_k_is_capped_and_sqlite_open_does_not_create_files() {
+    fn s4_top_k_is_capped() {
         let store = make_store(5, 4);
         assert_eq!(store.search(&[1.0, 0.0, 0.0, 0.0], usize::MAX).len(), 5);
+    }
+
+    #[cfg(feature = "cache")]
+    #[test]
+    fn s4_sqlite_open_does_not_create_files() {
         let missing = std::env::temp_dir().join(format!("vect-missing-{}.db", std::process::id()));
         let mut s = KnowledgeStore::new();
         assert!(s.load_from_sqlite(&missing.to_string_lossy()).is_err());

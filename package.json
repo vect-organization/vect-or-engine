@@ -1,6 +1,6 @@
 {
   "name": "@1abcdefggs/vect-or-engine",
-  "version": "0.3.13",
+  "version": "0.3.14",
   "description": "Ultra-fast local-first vector search (HNSW + SIMD) and real-time semantic document linting native engine in Rust with zero-overhead N-API bindings for Node.js and Electron.",
   "main": "index.js",
   "types": "index.d.ts",
@@ -60,10 +60,10 @@
     "node": ">= 24"
   },
   "scripts": {
-    "test": "node test/test-napi.js && node test/test-build-off-lock.js",
+    "test": "node test/test-napi.js && node test/test-build-off-lock.js && node test/test-load-from-string.js",
     "artifacts": "napi artifacts",
-    "build": "napi build --platform --release --features napi",
-    "build:debug": "napi build --platform --features napi",
+    "build": "napi build --platform --release --features napi,cache",
+    "build:debug": "napi build --platform --features napi,cache",
     "version": "napi version",
     "check:engine": "node scripts/engine-build-check.mjs"
   }

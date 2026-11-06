@@ -220,24 +220,39 @@ pub async fn load_knowledge_base(path: String) -> Result<u32> {
     Ok(count as u32)
 }
 
+/// Load a knowledge base from JSON text held in memory; no file is read or written (P8).
+/// Same format, limits and errors as `loadKnowledgeBase`; a failure keeps the previous one.
 #[napi]
-pub async fn load_kb_cache(path: String) -> Result<u32> {
-    verify_safe_path(&path)?;
+pub async fn load_knowledge_base_from_string(json: String) -> Result<u32> {
     let mut engine = ENGINE.write().await;
     let count = engine
         .knowledge_store
-        .load_from_sqlite(&path)
+        .load_from_json(&json)
         .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
     Ok(count as u32)
 }
 
+/// Load the SQLite cache. With `modelId`, a cache written for another model is rejected (R4).
+/// Needs a build with the `cache` feature (the npm build has it).
 #[napi]
-pub async fn save_kb_cache(path: String) -> Result<()> {
+pub async fn load_kb_cache(path: String, model_id: Option<String>) -> Result<u32> {
+    verify_safe_path(&path)?;
+    let mut engine = ENGINE.write().await;
+    let count = engine
+        .knowledge_store
+        .load_from_sqlite_with(&path, model_id.as_deref())
+        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
+    Ok(count as u32)
+}
+
+/// Write the SQLite cache atomically (P7) with a header (R4). `modelId`, when given, is stored.
+#[napi]
+pub async fn save_kb_cache(path: String, model_id: Option<String>) -> Result<()> {
     verify_safe_path(&path)?;
     let engine = ENGINE.read().await;
     engine
         .knowledge_store
-        .save_to_sqlite(&path)
+        .save_to_sqlite_with(&path, model_id.as_deref())
         .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))
 }
 

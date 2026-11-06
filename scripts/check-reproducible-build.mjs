@@ -14,7 +14,7 @@ const env = { ...process.env, SOURCE_DATE_EPOCH: '1700000000' };
 if (process.platform === 'win32') env.RUSTFLAGS = `${env.RUSTFLAGS ?? ''} -C link-arg=/Brepro`.trim();
 
 function build() {
-  const r = spawnSync('cargo', ['build', '--lib', '--features', 'napi'], { env, stdio: 'inherit', shell: process.platform === 'win32' });
+  const r = spawnSync('cargo', ['build', '--lib', '--features', 'napi,cache'], { env, stdio: 'inherit', shell: process.platform === 'win32' });
   if (r.status !== 0) { console.error('build failed'); process.exit(2); }
   return createHash('sha256').update(readFileSync(OUT)).digest('hex');
 }

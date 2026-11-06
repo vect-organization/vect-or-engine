@@ -60,8 +60,18 @@ export declare function validate(text: string): Promise<JsValidationResult>
  */
 export declare function loadProfile(path: string, matchMode?: string | undefined | null): Promise<void>
 export declare function loadKnowledgeBase(path: string): Promise<number>
-export declare function loadKbCache(path: string): Promise<number>
-export declare function saveKbCache(path: string): Promise<void>
+/**
+ * Load a knowledge base from JSON text held in memory; no file is read or written (P8).
+ * Same format, limits and errors as `loadKnowledgeBase`; a failure keeps the previous one.
+ */
+export declare function loadKnowledgeBaseFromString(json: string): Promise<number>
+/**
+ * Load the SQLite cache. With `modelId`, a cache written for another model is rejected (R4).
+ * Needs a build with the `cache` feature (the npm build has it).
+ */
+export declare function loadKbCache(path: string, modelId?: string | undefined | null): Promise<number>
+/** Write the SQLite cache atomically (P7) with a header (R4). `modelId`, when given, is stored. */
+export declare function saveKbCache(path: string, modelId?: string | undefined | null): Promise<void>
 export declare function buildIndex(): Promise<number>
 export declare function search(query: Float32Array, topK: number, ef?: number | undefined | null): Promise<Array<JsSearchResult>>
 export declare function kbInfo(): Promise<JsKbInfo>

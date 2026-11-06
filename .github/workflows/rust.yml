@@ -26,6 +26,8 @@ jobs:
       run: cargo build --verbose
     - name: Run tests
       run: cargo test --verbose
+    - name: Test with the SQLite cache feature
+      run: cargo test --verbose --features cache
     - name: Setup Node.js 24
       uses: actions/setup-node@v4
       with:
