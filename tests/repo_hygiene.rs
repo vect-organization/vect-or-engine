@@ -41,3 +41,12 @@ fn d13_docs_match_code() {
         assert!(!src.contains("get_unchecked"), "{file} uses get_unchecked");
     }
 }
+
+#[test]
+fn s9_mcp_server_is_gone() {
+    // The experimental server was removed; its design notes stay under docs/.
+    let root = env!("CARGO_MANIFEST_DIR");
+    assert!(!std::path::Path::new(&format!("{root}/mcp")).exists(), "mcp/ is back");
+    assert!(!read("package.json").contains("start-mcp"), "start-mcp is back in package.json");
+    assert!(!read("README.md").contains("start-mcp"), "README describes the removed server");
+}

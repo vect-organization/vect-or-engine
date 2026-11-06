@@ -1,7 +1,7 @@
 # engine:mcp-server-leftovers
 
 Change-log row: S9 (`docs/changes/v0.4.0.csv`). This repository has no ledger file, so the entry lives here.
-Status: recorded only. No MCP code was changed or deleted.
+Status: closed 2026-11-06 (owner decision). The server code was removed; this note and the design documents are kept for a future rebuild as a proper MCP implementation (the removed server answered only its own JSON-RPC methods, not `initialize` or `tools/list`).
 
 Surface: `mcp/server.mjs` (experimental HTTP server, `npm run start-mcp`).
 

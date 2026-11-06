@@ -39,4 +39,4 @@ S5,security,Med,A panic in a sync export crosses the C boundary,The host process
 S6,security,Low,The N-API path check covers only empty and NUL,Path policy is split,Fewer path entry points (S1); allow-list on the host,Review,No,D,,planned,
 S7,security,Low,"Unused dependencies (anyhow, once_cell, half serde, memmap2)",Larger advisory surface,Remove them; split CLI features; tokio 1.54.1 or later,s7_removed_dependencies_stay_removed,No,A,0.3.8,done,
 S8,security,Low,"No cargo deny or audit, and no fuzzing",Late detection,cargo deny on PRs; 3 fuzz targets; property test,s8_linear_search_matches_naive_reference (deny job passed in CI; fuzz targets in fuzz/),No,F,0.3.13,done,
-S9,security,Low,"MCP leftovers (CORS value, token off by default, stale binary names)",Experimental surface,Tracked as ledger engine:mcp-server-leftovers,Review,No,F,,in-progress,
+S9,security,Low,"MCP leftovers (CORS value, token off by default, stale binary names)",Experimental surface,"Removed the experimental MCP server (mcp/, start-mcp, README sections); design notes kept in docs/",s9_mcp_server_is_gone (tests/repo_hygiene.rs),Yes,F,0.4.0,done,

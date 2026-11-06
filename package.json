@@ -61,7 +61,6 @@
   },
   "scripts": {
     "test": "node test/test-napi.js && node test/test-build-off-lock.js",
-    "start-mcp": "node mcp/server.mjs",
     "artifacts": "napi artifacts",
     "build": "napi build --platform --release --features napi",
     "build:debug": "napi build --platform --features napi",

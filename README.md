@@ -217,34 +217,6 @@ The full procedure, reports and reproduction script are in [verification/recall]
 
 ---
 
-## MCP Server (Experimental, Not in a Release Yet)
-
-> ⚠️ `mcp/server.mjs` is experimental reference code. It is not used by VectOrEdit and has not been tested end to end.
-
-### Start the Server
-
-```bash
-npm run start-mcp
-```
-
-It listens on `127.0.0.1:4000` (change with `PORT`) and takes JSON-RPC requests at `POST /mcp`. Methods: `ping`, `load`, `build`, `search`, `validate`, `kb_info`.
-
-### Request Gate: Host Check, Optional Token, Allowed Folder
-
-Every request passes a gate before it runs (on `main` since PR #25; not yet in a published release, planned for 0.4.0):
-
-| Check | Default | Setting |
-| :--- | :--- | :--- |
-| `Host` and `Origin` headers must be `127.0.0.1` or `localhost` (blocks DNS rebinding and cross-site requests) | On; HTTP 403 otherwise | None |
-| `Authorization: Bearer <token>` | Off; the server logs a warning at startup | Set `MCP_AUTH_TOKEN`; HTTP 401 without the right token |
-| `load` paths must resolve (links included) under an allowed folder | On; the folder is this repository | Set `KB_ALLOWED_ROOT`; the server stops at startup if it does not exist |
-
-### Error Codes Returned to the Client
-
-Errors follow JSON-RPC 2.0: -32700 parse error, -32600 invalid request, -32601 unknown method, -32602 invalid params (with the reason), -32603 internal error (details only in the server log).
-
----
-
 ## Build and Test from Source
 
 ### Requirements: Rust and Node.js 24
@@ -320,8 +292,6 @@ vect-or-engine/
 ├── package.json        # npm package configuration & NAPI metadata (@1abcdefggs/vect-or-engine)
 ├── LICENSE             # MIT License
 ├── README.md           # Documentation
-├── mcp/
-│   └── server.mjs      # Model Context Protocol (MCP) JSON-RPC HTTP server
 ├── scripts/
 │   └── engine-build-check.mjs # Checks that a built .node matches HEAD (npm run check:engine)
 ├── examples/
@@ -358,13 +328,9 @@ No runtime npm dependencies; `npm audit` reports 0 vulnerabilities. GitHub Depen
 - **SQL**: the SQLite cache (`knowledge_store.rs`) uses prepared statements with bound parameters (`rusqlite::params!`); no SQL is built from strings
 - **`unsafe` code**: none in the core modules (each has `#![forbid(unsafe_code)]`, since 0.3.8). Memory safety is checked at compile time
 
-### MCP Server Exposure
-
-The experimental MCP server runs only when started with `npm run start-mcp` and listens on `127.0.0.1` only. On `main` it checks `Host` / `Origin`, limits `load` to `KB_ALLOWED_ROOT` and supports an opt-in bearer token (warning at startup when unset); this gate is not yet in a published release (planned for 0.4.0), and 0.3.6 and earlier have no gate. Since 0.3.6 the server does not return raw error details to the client (CodeQL alert #1); internal errors answer `Internal error` and are logged on the server.
-
 ### Earlier Audit (Not Quoted)
 
-An earlier audit (2026-09-14) is kept as an internal record and is not published here. It did not cover the `unsafe` blocks or the missing MCP gate, so its rating is not quoted.
+An earlier audit (2026-09-14) is kept as an internal record and is not published here. It did not cover the `unsafe` blocks or the experimental MCP server (removed in 0.4.0), so its rating is not quoted.
 
 ---
 
