@@ -146,22 +146,18 @@ fn run_vector(
 
     let mut hits = 0usize;
     let mut lat_us: Vec<f64> = Vec::with_capacity(queries);
+    let mut scan_us: Vec<f64> = Vec::with_capacity(queries);
     for q in &qs {
         let t = Instant::now();
         let found = index.search_with(q, TOP_K, params.ef_search);
         lat_us.push(t.elapsed().as_secs_f64() * 1e6);
+        // Exact scan timed on every query (C2: exact vs HNSW), outside the HNSW timer.
+        let t = Instant::now();
         let truth = exact_top_k(&data, q, TOP_K);
+        scan_us.push(t.elapsed().as_secs_f64() * 1e6);
         hits += found.iter().filter(|(_, i)| truth.contains(i)).count();
     }
     let recall = hits as f64 / (queries * TOP_K) as f64;
-
-    let sample = queries.min(100);
-    let mut scan_us: Vec<f64> = Vec::with_capacity(sample);
-    for q in qs.iter().take(sample) {
-        let t = Instant::now();
-        let _ = exact_top_k(&data, q, TOP_K);
-        scan_us.push(t.elapsed().as_secs_f64() * 1e6);
-    }
 
     lat_us.sort_by(|a, b| a.total_cmp(b));
     scan_us.sort_by(|a, b| a.total_cmp(b));

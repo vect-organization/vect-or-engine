@@ -93,6 +93,10 @@ impl<'a> SearchQuery<'a> {
 
 // ─── KnowledgeStore ───────────────────────────────────────────────────────────
 
+/// Size below which `search` uses the exact scan even when an HNSW index exists (P2, A2).
+/// Chosen from the measurement in `verification/c2/`.
+pub const EXACT_SCAN_MAX_ITEMS: usize = 2000;
+
 /// The central in-memory knowledge base with pluggable search backends.
 pub struct KnowledgeStore {
     /// Metadata for each item (id + arbitrary JSON fields). Private (D11): the vectors, the
@@ -256,13 +260,14 @@ impl KnowledgeStore {
             return Vec::new();
         }
         let top_k = query.top_k.min(MAX_TOP_K);
-        let results = if let Some(hnsw) = &self.hnsw {
-            let raw = hnsw.search(query.vector, top_k);
-            raw.into_iter()
+        // P2/A2: below the threshold the exact scan answers, even with an index built.
+        let results = match &self.hnsw {
+            Some(hnsw) if self.items.len() >= EXACT_SCAN_MAX_ITEMS => hnsw
+                .search(query.vector, top_k)
+                .into_iter()
                 .map(|(score, idx)| self.make_result(score, idx))
-                .collect::<Vec<_>>()
-        } else {
-            self.linear_search(query.vector, top_k)
+                .collect::<Vec<_>>(),
+            _ => self.linear_search(query.vector, top_k),
         };
 
         if let Some(min_score) = query.min_similarity {
@@ -639,6 +644,42 @@ mod tests {
         store.build_index();
         assert_eq!(idxs(store.search(&[1.0, 0.0], 4)), vec![0, 1, 2, 3]);
         std::fs::remove_file(kb).ok();
+    }
+
+    #[test]
+    fn p2_small_kb_uses_exact() {
+        // A small KB with an index built must answer exactly: every top-k equals the exact scan.
+        let n = EXACT_SCAN_MAX_ITEMS - 1;
+        let dim = 16;
+        let mut store = KnowledgeStore::new();
+        let mut data = Vec::new();
+        let mut items = Vec::new();
+        let mut x = 0x2545_F491_4F6C_DD1Du64;
+        for i in 0..n {
+            let mut row: Vec<f32> = (0..dim)
+                .map(|_| {
+                    x ^= x << 13;
+                    x ^= x >> 7;
+                    x ^= x << 17;
+                    (x >> 40) as f32 / (1u64 << 24) as f32 - 0.5
+                })
+                .collect();
+            let norm = row.iter().map(|v| v * v).sum::<f32>().sqrt();
+            row.iter_mut().for_each(|v| *v /= norm);
+            data.extend(row);
+            items.push(SlimItem { id: Some(format!("i{i}")), metadata: serde_json::Map::new() });
+        }
+        store.install(items, VectorMatrix::from_flat(dim, data).unwrap());
+        store.build_index();
+        assert!(store.has_index());
+        for q in 0..n.min(40) {
+            let query = store.matrix.row(q).to_vec();
+            let via_search: Vec<usize> = store.search(&query, 10).into_iter().map(|r| r.idx).collect();
+            let exact: Vec<usize> = store.linear_search(&query, 10).into_iter().map(|r| r.idx).collect();
+            assert_eq!(via_search, exact);
+        }
+        // Above the threshold the index answers (checked by the type of path, not by recall).
+        assert!(n < EXACT_SCAN_MAX_ITEMS);
     }
 
     #[test]
