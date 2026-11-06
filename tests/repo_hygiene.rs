@@ -43,6 +43,32 @@ fn d13_docs_match_code() {
 }
 
 #[test]
+fn s3_sqlite_is_optional_and_off_by_default() {
+    let manifest = read("Cargo.toml");
+    let line = manifest.lines().find(|l| l.starts_with("rusqlite")).expect("rusqlite line");
+    assert!(line.contains("optional = true"), "rusqlite must stay optional: {line}");
+    let features = manifest.split("[features]").nth(1).unwrap().split("[dependencies]").next().unwrap();
+    let default = features.lines().find(|l| l.starts_with("default")).unwrap();
+    assert!(!default.contains("cache"), "the cache feature must not be a default feature");
+    assert!(features.contains("cache = [\"dep:rusqlite\"]"));
+}
+
+#[test]
+fn s6_every_path_taking_export_uses_the_one_path_check() {
+    let src = read("src/napi_bindings.rs");
+    let mut checked = 0;
+    for part in src.split("#[napi]").skip(1) {
+        let head = part.lines().find(|l| l.contains("fn ")).unwrap_or("");
+        if head.contains("path: String") {
+            let body: String = part.lines().take(12).collect::<Vec<_>>().join("\n");
+            assert!(body.contains("verify_safe_path(&path)?"), "no path check in: {head}");
+            checked += 1;
+        }
+    }
+    assert!(checked >= 4, "expected the profile, KB and two cache exports, found {checked}");
+}
+
+#[test]
 fn s9_mcp_server_is_gone() {
     // The experimental server was removed; its design notes stay under docs/.
     let root = env!("CARGO_MANIFEST_DIR");

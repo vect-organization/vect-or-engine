@@ -9,7 +9,7 @@ and this project adheres to [Semantic Versioning](https://semver.org/spec/v2.0.0
 
 ## [Unreleased]
 
-Planned as 0.4.0: the MCP request gate changes how the server is used.
+The MCP request gate described below was added and then removed together with the server in 0.3.14 (S9).
 
 ### Security
 - MCP server ran any request without a gate (Copilot code-scanning AI finding on PR #17, "Excessive agency risk"). Added before dispatch: `Host` / `Origin` must be `127.0.0.1` or `localhost` (HTTP 403), an opt-in bearer token via `MCP_AUTH_TOKEN` (HTTP 401), and `load` paths must resolve, links included, under `KB_ALLOWED_ROOT` (default: the repository; checked as written before any file access, then after resolving links). **Behaviour change**: `load` outside the repository now needs `KB_ALLOWED_ROOT`
@@ -28,7 +28,19 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ---
 
-## [Unreleased]
+## [0.3.14] - 2026-11-06
+
+Phase D of the 0.4.0 work (cache and input). Change-log rows: `docs/changes/v0.4.0.csv` (P7, P8, R4, S3, S6, S9; S1 closes with the fixed Edit release).
+
+### Added
+- **P8**: `loadKnowledgeBaseFromString(json)` loads a knowledge base from JSON text held in memory, with the same format, limits and errors as `loadKnowledgeBase`; a failure keeps the previous one. No file is read or written
+- **R4**: the SQLite cache has a header (format version, dimension, item count, a hash of the rows and, when given, the model id). `saveKbCache(path, modelId?)` and `loadKbCache(path, modelId?)` take an optional model id; a cache with another model, a missing or mismatching header or edited rows is rejected and the loaded knowledge base is kept
+
+### Changed
+- **P7 (breaking cache format)**: the cache is written to a temporary file in one transaction and renamed over the target, so a crash leaves the old cache or none. **Caches written by 0.3.13 and earlier have no header and are rejected; rebuild them from the JSON**
+- **S3**: SQLite is the optional cargo feature `cache`, off by default (the npm build `npm run build` turns it on). Without it the cache calls return an error and the default build has no SQLite code. rusqlite 0.31 to 0.41, which bundles SQLite 3.54.1 (was 3.45.0)
+- **S6**: every export that takes a path goes through the one path check, and a test keeps it that way
+- CI runs the tests a second time with `--features cache`
 
 ### Removed
 - **S9**: the experimental MCP server (`mcp/server.mjs`, `npm run start-mcp`) and its README sections. It was a private JSON-RPC HTTP API, not MCP (it rejected `initialize` and `tools/list`), unused by VectOrEdit and untested. The design notes stay in `docs/`. Change-log row S9 ships in 0.4.0
