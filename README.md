@@ -254,6 +254,8 @@ cargo run --bin vect_or_engine_cli
 
 The CLI reads one JSON-RPC request per line on stdin (`{"method":"ping","id":"1"}`) and writes one response per line on stdout. It runs on Windows and Linux (Linux checked under WSL Ubuntu on 2026-11-03). File paths must be relative; absolute paths and `..` are rejected.
 
+The default CLI build has no SQLite code, so `save_kb_cache` and `load_kb_cache` return an error. Build with `cargo run --features cli,cache --bin vect_or_engine_cli` to use them.
+
 - Requests run concurrently, so responses can arrive out of order; match them by `id`
 - The process exits as soon as stdin closes, and responses still in progress are dropped; keep stdin open until every response has arrived
 
