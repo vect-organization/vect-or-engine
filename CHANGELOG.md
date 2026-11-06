@@ -28,6 +28,13 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ---
 
+## [Unreleased]
+
+### Removed
+- **S9**: the experimental MCP server (`mcp/server.mjs`, `npm run start-mcp`) and its README sections. It was a private JSON-RPC HTTP API, not MCP (it rejected `initialize` and `tools/list`), unused by VectOrEdit and untested. The design notes stay in `docs/`. Change-log row S9 ships in 0.4.0
+
+---
+
 ## [0.3.13] - 2026-11-06
 
 Phase F of the 0.4.0 work (gates). Change-log rows: `docs/changes/v0.4.0.csv` (R3, S5, S8, S9; S9 waits for an owner decision).
