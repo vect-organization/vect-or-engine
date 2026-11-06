@@ -26,7 +26,17 @@ use crate::matrix::{dot, VectorMatrix};
 
 use crate::engine_error::EngineError;
 
-/// Version of the SQLite cache layout (R4). Bump it when the table layout or the hash changes.
+/// A checked knowledge base that is not yet installed (see `KnowledgeStore::prepare_json`).
+pub struct PreparedKb {
+    items: Vec<SlimItem>,
+    matrix: VectorMatrix,
+    report: NormReport,
+}
+
+/// Version of the SQLite cache layout (R4). Bump it whenever the table layout, the hash or the
+/// hashed text changes. The row hash covers the metadata text exactly as stored, so a change
+/// that re-serialises or normalises it on load would invalidate every existing cache and must
+/// come with a new version.
 #[cfg(feature = "cache")]
 const CACHE_FORMAT_VERSION: u32 = 1;
 
@@ -309,6 +319,41 @@ impl KnowledgeStore {
     }
 
     fn load_from_bytes(&mut self, bytes: &[u8]) -> Result<usize, EngineError> {
+        let prepared = Self::prepare_bytes(bytes)?;
+        Ok(self.load_prepared(prepared))
+    }
+
+    /// Parse and check a knowledge base from JSON text without touching any store, so a host
+    /// can do the CPU-bound work outside the engine lock and call `load_prepared` under it.
+    pub fn prepare_json(json: &str) -> Result<PreparedKb, EngineError> {
+        if json.len() as u64 > MAX_KB_BYTES {
+            return Err(EngineError::InvalidInput(format!(
+                "knowledge base is {} bytes, larger than the {MAX_KB_BYTES} byte limit",
+                json.len()
+            )));
+        }
+        Self::prepare_bytes(json.as_bytes())
+    }
+
+    /// Same as `prepare_json`, reading the file first (same size limit as `load_from_path`).
+    pub fn prepare_path(path: &str) -> Result<PreparedKb, EngineError> {
+        let size = fs::metadata(path)?.len();
+        if size > MAX_KB_BYTES {
+            return Err(EngineError::InvalidInput(format!(
+                "knowledge base file is {size} bytes, larger than the {MAX_KB_BYTES} byte limit"
+            )));
+        }
+        Self::prepare_bytes(&fs::read(path)?)
+    }
+
+    /// Install a prepared knowledge base in one step. Cannot fail. Returns the item count.
+    pub fn load_prepared(&mut self, p: PreparedKb) -> usize {
+        let count = p.items.len();
+        self.install(p.items, p.matrix, p.report);
+        count
+    }
+
+    fn prepare_bytes(bytes: &[u8]) -> Result<PreparedKb, EngineError> {
         let raw: Vec<KnowledgeItem> = serde_json::from_slice(bytes)?;
         let count = raw.len();
 
@@ -339,8 +384,7 @@ impl KnowledgeStore {
         }
 
         let report = normalise_all(new_dim, &mut data);
-        self.install(items, VectorMatrix::from_flat(new_dim, data)?, report);
-        Ok(count)
+        Ok(PreparedKb { items, matrix: VectorMatrix::from_flat(new_dim, data)?, report })
     }
 
     /// Replace the whole knowledge base in one step: items, vectors, dimension, a dropped
