@@ -212,24 +212,25 @@ pub async fn load_profile(path: String, match_mode: Option<String>) -> Result<()
 #[napi]
 pub async fn load_knowledge_base(path: String) -> Result<u32> {
     verify_safe_path(&path)?;
-    let mut engine = ENGINE.write().await;
-    let count = engine
-        .knowledge_store
-        .load_from_path(&path)
+    // Read and parse off the engine lock and off the async worker; only the install is locked.
+    let prepared = tokio::task::spawn_blocking(move || KnowledgeStore::prepare_path(&path))
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?
         .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    Ok(count as u32)
+    let mut engine = ENGINE.write().await;
+    Ok(engine.knowledge_store.load_prepared(prepared) as u32)
 }
 
 /// Load a knowledge base from JSON text held in memory; no file is read or written (P8).
 /// Same format, limits and errors as `loadKnowledgeBase`; a failure keeps the previous one.
 #[napi]
 pub async fn load_knowledge_base_from_string(json: String) -> Result<u32> {
-    let mut engine = ENGINE.write().await;
-    let count = engine
-        .knowledge_store
-        .load_from_json(&json)
+    let prepared = tokio::task::spawn_blocking(move || KnowledgeStore::prepare_json(&json))
+        .await
+        .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?
         .map_err(|e| Error::new(Status::GenericFailure, e.to_string()))?;
-    Ok(count as u32)
+    let mut engine = ENGINE.write().await;
+    Ok(engine.knowledge_store.load_prepared(prepared) as u32)
 }
 
 /// Load the SQLite cache. With `modelId`, a cache written for another model is rejected (R4).
