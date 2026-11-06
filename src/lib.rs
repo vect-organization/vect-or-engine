@@ -9,6 +9,7 @@
 
 pub mod engine_error;
 pub mod limits;
+pub mod matrix;
 pub mod profile;
 pub mod validator;
 pub mod translator;
@@ -17,6 +18,7 @@ pub mod knowledge_store;
 
 pub use engine_error::EngineError;
 pub use hnsw_index::HnswIndex;
+pub use matrix::{dot, VectorMatrix};
 pub use knowledge_store::{BuiltIndex, IndexJob, KnowledgeItem, KnowledgeStore, SearchQuery, SearchResult};
 pub use profile::Profile;
 pub use translator::{TranslationMatch, Translator};
