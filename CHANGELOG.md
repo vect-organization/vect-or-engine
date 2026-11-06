@@ -28,6 +28,18 @@ Planned as 0.4.0: the MCP request gate changes how the server is used.
 
 ---
 
+## [0.3.12] - 2026-11-06
+
+Phase E of the 0.4.0 work (linter). Change-log rows: `docs/changes/v0.4.0.csv` (P6, D5, A6). Measurements: `verification/validator/p6_bench.md`.
+
+### Changed
+- **P6**: the keyword rules are matched with one Aho-Corasick pass for the literal words and one `RegexSet` pass for the regex words, instead of one scan per trigger word. Which rule fires, and the marker lines, are unchanged. On a 10,000-character document with 1,000 keyword rules, p50 went from 1.36 ms to 0.02 ms (literal, no match), 1.71 ms to 0.03 ms (literal, match), 1.70 ms to 0.07 ms (both, no match) and 0.53 ms to 0.07 ms (regex, no match)
+- **D5 (behaviour change)**: conflict items are matched longest-first (`LeftmostLongest`). With both `F20` and `F20.0` as conflict items, a document that says `F20.0` now reports `F20.0`; before, only `F20` was reported because the shorter match ended first
+- **A6**: opt-in text normalisation. `Validator::with_options(profile, mode, true)` NFKC-normalises and lower-cases the document and the literal words before matching, so full-width codes (`Ｆ２０`) and case variants hit. Marker lines and offsets still refer to the original text (an offset map is kept). Regex words are used as written. The default (`with_mode`, and everything reachable from Node.js) is unchanged: this option is Rust API only for now
+- New dependency: `unicode-normalization` 0.1 (and its `tinyvec`)
+
+---
+
 ## [0.3.11] - 2026-11-06
 
 Phase C2 to C4 of the 0.4.0 work (search core). Change-log rows: `docs/changes/v0.4.0.csv` (P2, P5, A1, A2, A4). Measurements: `verification/c2/`, `verification/c3/`.
