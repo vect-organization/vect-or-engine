@@ -124,7 +124,7 @@ All state (profile, knowledge base, index) lives in one engine instance per proc
 | `loadKnowledgeBase(path: string)` | `Promise<number>` (entries) | Read a knowledge JSON file |
 | `loadKnowledgeBaseFromString(json: string)` | `Promise<number>` (entries) | Same as `loadKnowledgeBase`, from JSON text in memory; no file is read or written |
 | `saveKbCache(path: string, modelId?: string)` | `Promise<void>` | Write the loaded vectors to SQLite (atomic; stores a header and the model id) |
-| `loadKbCache(path: string, modelId?: string)` | `Promise<number>` (entries) | Read vectors from the SQLite cache; rejects a cache with another model or a bad header, and caches from 0.3.13 and earlier |
+| `loadKbCache(path: string, modelId?: string)` | `Promise<number>` (entries) | Read vectors from the SQLite cache; rejects a cache with another model, a missing or inconsistent header, and caches from 0.3.13 and earlier. The header check (a non-cryptographic hash) catches accidental damage, not deliberate tampering |
 | `buildIndex()` | `Promise<number>` (indexed) | Build the HNSW graph |
 | `search(query: Float32Array, topK: number, ef?: number)` | `Promise<{ idx, score, id?, metadata }[]>` | Nearest entries by cosine similarity (vectors and query are normalised to unit length); the query length must match the stored dimension; `ef` is the optional HNSW width, default `max(64, 2 * topK)` |
 | `kbInfo()` | `Promise<{ count, dim, hnswReady, maxNormDeviation, rescaledCount }>` | State of the knowledge base; `hnswReady` stays false under 10,000 items, which are searched exactly and need no index |
